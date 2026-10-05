@@ -1,0 +1,37 @@
+name: Release
+# Push a tag vX.Y.Z (matching VERSION): the .dmg is built here, checked, and attached to that release, so no
+# released binary is ever built on a personal machine. The release notes come from the annotated tag message.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag matches VERSION
+        run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME"
+      - name: Tests
+        run: |
+          python3 -m unittest discover -s tests
+          (cd helpers && python3 -m unittest discover -p 'test_*.py')
+      - name: Build the .dmg
+        run: scripts/make-dmg.sh
+      - name: No personal data in the repo or the built app
+        run: scripts/check-personal.sh
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG="dist/Account-Rotator-$(cat VERSION).dmg"
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "Account Rotator $(cat VERSION)" --notes-file notes.md
+          gh release upload "$GITHUB_REF_NAME" "$DMG" --clobber
+          shasum -a 256 "$DMG"

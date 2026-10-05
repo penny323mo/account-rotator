@@ -102,8 +102,16 @@ enum Services {
             try? fm.removeItem(atPath: incoming)
             if (try? fm.copyItem(atPath: bundled, toPath: incoming)) != nil {
                 labels.forEach(stop)
-                try? fm.removeItem(atPath: root)
-                if (try? fm.moveItem(atPath: incoming, toPath: root)) == nil { problem = "未能安裝新版本嘅程式。" }
+                // Keep the installed copy aside until the new one is in place; put it back if the swap fails.
+                let previous = support + "/rotator.previous"
+                try? fm.removeItem(atPath: previous)
+                try? fm.moveItem(atPath: root, toPath: previous)
+                if (try? fm.moveItem(atPath: incoming, toPath: root)) == nil {
+                    problem = "未能安裝新版本嘅程式。"
+                    try? fm.moveItem(atPath: previous, toPath: root)
+                    try? fm.removeItem(atPath: incoming)
+                }
+                try? fm.removeItem(atPath: previous)
             } else {
                 problem = "未能抄新版本嘅程式去「Application Support」。"
             }

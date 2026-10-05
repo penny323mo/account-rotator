@@ -10,6 +10,17 @@ runs out, and start idle accounts' usage clocks.
 > 帳號資料（登入 token）只會儲存喺你部 Mac 嘅 Keychain，唔會上傳去任何地方。
 > Sign-ins (tokens) are stored only in this Mac's Keychain and are never uploaded anywhere.
 
+## 注意 · Disclaimer
+
+- 本 app 同 Google、OpenAI、Anthropic 冇任何關係。查用量用嘅係呢幾間公司冇公開承諾嘅接口，佢哋隨時可以改，令某部分功能停用。
+  This app is not affiliated with Google, OpenAI or Anthropic. Usage is read through interfaces they do not
+  publish or promise to keep; they may change at any time and break parts of the app.
+- 用多個帳號輪流避開用量上限，可能違反呢幾間公司嘅使用條款，帳號有機會被限制或者停用。**風險由用家自己承擔。**
+  Rotating several accounts to get past usage limits may break these companies' terms of service, and accounts may
+  be limited or suspended. **Use at your own risk.**
+- 「自動喚醒」會用你嘅帳號真係發一句短 prompt，會用少少額度。
+  Waking an idle account really sends a short prompt with that account and uses a little of its quota.
+
 ## 功能 · Features
 
 | | Antigravity | Codex | Claude Code |

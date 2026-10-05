@@ -7,4 +7,9 @@ if git grep -nIE "$pattern" -- . ':!scripts/check-personal.sh'; then
   echo 'Personal data found (above). Remove it before committing.' >&2
   exit 1
 fi
+# A built app (dist/) must not carry the build machine's paths either (debug info, object-file names).
+if [[ -d "dist/Account Rotator.app" ]] && LC_ALL=C grep -r -a -l -E '/Users/[a-z0-9]{3,}/' "dist/Account Rotator.app"; then
+  echo 'The built app above contains a home folder path. Build with scripts/build.sh (it strips them).' >&2
+  exit 1
+fi
 echo 'No personal data found.'
