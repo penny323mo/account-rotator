@@ -380,9 +380,14 @@ class Handler(BaseHTTPRequestHandler):
     def key(self):
         """Who to count failures against: through a tunnel everyone is 127.0.0.1, so use the forwarded address."""
         if self.from_this_mac():
-            for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP', 'X-Forwarded-For'):
-                # The last X-Forwarded-For entry is the one the local tunnel appended; earlier ones are the sender's.
-                value = (self.headers.get(header) or '').split(',')[-1].strip()
+            # The last X-Forwarded-For entry is the one the local tunnel appended; earlier entries, and headers such
+            # as X-Real-IP that a tunnel like ngrok passes through untouched, are the sender's own. Only without
+            # X-Forwarded-For are the others used.
+            forwarded = (self.headers.get('X-Forwarded-For') or '').split(',')[-1].strip()
+            if forwarded:
+                return 'fwd:' + forwarded[:64]
+            for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP'):
+                value = (self.headers.get(header) or '').strip()
                 if value:
                     return 'fwd:' + value[:64]
         return self.client

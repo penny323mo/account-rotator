@@ -334,6 +334,18 @@ class ForwardedKeyTests(RemoteTests):
         self.assertEqual(status, 429)
 
 
+class SpoofedHeaderKeyTests(RemoteTests):
+    def test_x_real_ip_cannot_replace_the_appended_address(self):
+        for i in range(web.FAILURES):
+            self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                         {'Content-Type': 'application/json', 'Host': self.PUBLIC, 'X-Real-IP': f'10.1.1.{i}',
+                          'X-Forwarded-For': '198.51.100.7'})
+        status = self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                              {'Content-Type': 'application/json', 'Host': self.PUBLIC, 'X-Real-IP': '10.2.2.2',
+                               'X-Forwarded-For': '198.51.100.7'})[0]
+        self.assertEqual(status, 429)
+
+
 class RemoteOffProxyTests(WebTests):
     def test_with_remote_off_a_proxy_header_changes_nothing(self):
         # Off means exactly the old behaviour (an existing Caddy in front keeps working).
