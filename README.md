@@ -120,6 +120,9 @@ shown address on the phone and type the code. A code works once, within 5 minute
   `X-Forwarded-For`、`Forwarded`、`Via` 之類）喺 3082 會被拒絕。
   Port 3083 is for tunnels: everything arriving there is remote and needs pairing. **Do not point a tunnel at 3082**;
   proxied requests (with `X-Forwarded-For`, `Forwarded`, `Via` …) are refused there.
+- 自己架嘅反向 proxy（例如 nginx 嘅 `proxy_pass`）都一樣要指去 3083：nginx 預設唔加上面嗰啲 header，指去 3082 就會被當成呢部 Mac
+  本身，唔使配對就用得。· Your own reverse proxy (e.g. nginx `proxy_pass`) must also point at 3083: nginx adds none of
+  those headers by default, so pointed at 3082 it would pass for this Mac without pairing.
 
 ## 安全 · Security
 

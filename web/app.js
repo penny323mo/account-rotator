@@ -60,7 +60,8 @@ function stamp(t){return t?date(new Date(t*1000).toISOString()):'—';}
 function renderRemote(){const r=remoteInfo;if(!r)return;$('remoteEnabled').checked=r.enabled;$('remoteOptions').hidden=!r.enabled;$('pairStart').disabled=!r.enabled;
   $('remoteLan').checked=r.lan;$('lanAddr').textContent=r.lan_addresses.length?`手機開 http://${r.lan_addresses[0]}:${r.port}`:'呢部 Mac 而家未連到 Wi-Fi／區域網絡。';
   $('tailscaleRow').hidden=!r.tailscale_addresses.length&&!r.tailscale;$('remoteTailscale').checked=r.tailscale;$('tailscaleAddr').textContent=r.tailscale_addresses.length?`手機（都開住 Tailscale）開 http://${r.tailscale_addresses[0]}:${r.port}`:'Tailscale 而家未連線。';
-  if(document.activeElement!==$('remotePublic'))$('remotePublic').value=r.public;const ng=r.ngrok.find(h=>h!==r.public);$('ngrokHint').hidden=!ng;if(ng)$('ngrokHint').innerHTML=`偵測到 ngrok：<button type="button" class="text" data-use-ngrok="${esc(ng)}">用 ${esc(ng)}</button>`;
+  if(document.activeElement!==$('remotePublic'))$('remotePublic').value=r.public;const wrong=r.ngrok.find(t=>t.port&&t.port!==r.tunnel_port),ng=r.ngrok.find(t=>t.port===r.tunnel_port&&t.host!==r.public);$('ngrokHint').hidden=!wrong&&!ng;
+  $('ngrokHint').innerHTML=wrong?`<span class="warn-text">你嘅 ngrok（${esc(wrong.host)}）指緊 ${esc(String(wrong.port))}，唔係 ${r.tunnel_port}：請改用 <b>ngrok http ${r.tunnel_port}</b>，否則手機會一直被拒絕。</span>`:ng?`偵測到 ngrok：<button type="button" class="text" data-use-ngrok="${esc(ng.host)}">用 ${esc(ng.host)}</button>`:'';
   $('remoteFull').checked=r.full;
   $('deviceList').innerHTML=r.devices.map(d=>`<li><div>${esc(d.name||'裝置')}<small>配對於 ${esc(stamp(d.paired_at))} · 最近使用 ${esc(stamp(d.last_used))}</small></div><button type="button" class="manage-remove" data-device-remove="${esc(d.id)}">移除</button></li>`).join('')||'<li><small>未有已配對嘅裝置。</small></li>';}
 async function loadRemote(){try{remoteInfo=await localCall('remote.info');renderRemote();}catch(e){announce(errors[e.message]||`未能讀取手機遙控設定：${e.message}`,true);}}

@@ -302,6 +302,38 @@ class TunnelTests(RemoteTests):
         self.assertTrue(self.local('remote.set', {'enabled': False})[1]['result']['restarting'])
 
 
+class AddressTests(unittest.TestCase):
+    IFCONFIG = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.27 netmask 0xffffff00 broadcast 192.168.1.255
+bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255
+vmnet8: flags=8863<UP> mtu 1500
+\tinet 172.16.5.1 netmask 0xffffff00
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.105.1.2 --> 100.105.1.2 netmask 0xffffffff
+utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
+\tinet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff
+"""
+
+    def test_only_wifi_ethernet_and_tailscale_addresses(self):
+        self.assertEqual(web.interface_addresses(self.IFCONFIG), (['192.168.1.27'], ['100.105.1.2']))
+
+
+class ForwardedKeyTests(RemoteTests):
+    def test_limit_counts_the_address_the_tunnel_appended(self):
+        # A sender cannot dodge the limit by putting a new address first: the tunnel appends the real one last.
+        for i in range(web.FAILURES):
+            self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                         {'Content-Type': 'application/json', 'Host': self.PUBLIC,
+                          'X-Forwarded-For': f'10.0.0.{i}, 198.51.100.7'})
+        status = self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                              {'Content-Type': 'application/json', 'Host': self.PUBLIC,
+                               'X-Forwarded-For': '10.9.9.9, 198.51.100.7'})[0]
+        self.assertEqual(status, 429)
+
+
 class RemoteOffProxyTests(WebTests):
     def test_with_remote_off_a_proxy_header_changes_nothing(self):
         # Off means exactly the old behaviour (an existing Caddy in front keeps working).

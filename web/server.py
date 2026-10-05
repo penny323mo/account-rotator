@@ -84,19 +84,29 @@ def device_name(agent):
     return '瀏覽器'
 
 
-def interface_addresses():
-    """This Mac's IPv4 addresses: (private Wi-Fi / LAN ones, Tailscale ones)."""
+def interface_addresses(out=None):
+    """This Mac's IPv4 addresses: (Wi-Fi / Ethernet ones, Tailscale ones). Wi-Fi and Ethernet are the en*
+    interfaces; Docker / virtual machine bridges, VPN tunnels and the like are left out (Tailscale is recognised by
+    its 100.64.0.0/10 range, whatever its interface)."""
     lan, tailnet = [], []
-    try:
-        out = subprocess.run(['/sbin/ifconfig'], capture_output=True, text=True, timeout=3).stdout
-    except (OSError, subprocess.SubprocessError):
-        return lan, tailnet
-    for addr in re.findall(r'inet (\d+\.\d+\.\d+\.\d+)', out):
-        ip = ipaddress.ip_address(addr)
+    if out is None:
+        try:
+            out = subprocess.run(['/sbin/ifconfig'], capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            return lan, tailnet
+    name = ''
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            name = line.split(':', 1)[0]
+            continue
+        found = re.match(r'\s+inet (\d+\.\d+\.\d+\.\d+)', line)
+        if not found:
+            continue
+        ip = ipaddress.ip_address(found.group(1))
         if ip in TAILNET:
-            tailnet.append(addr)
-        elif ip.is_private and not ip.is_loopback and not ip.is_link_local:
-            lan.append(addr)
+            tailnet.append(found.group(1))
+        elif name.startswith('en') and ip.is_private and not ip.is_loopback and not ip.is_link_local:
+            lan.append(found.group(1))
     return list(dict.fromkeys(lan)), list(dict.fromkeys(tailnet))
 
 
@@ -105,13 +115,22 @@ def lan_addresses():
 
 
 def ngrok_hosts():
-    """Public hosts of a running ngrok agent (its local API), if any."""
+    """[{'host', 'port'}] for each HTTPS tunnel of a running ngrok agent (its local API): port is where it points,
+    so the console can say when it is not the tunnel port."""
     try:
         with urllib.request.urlopen('http://127.0.0.1:4040/api/tunnels', timeout=1) as r:
             tunnels = json.load(r).get('tunnels') or []
     except Exception:
         return []
-    return [urlsplit(t.get('public_url', '')).netloc for t in tunnels if t.get('public_url', '').startswith('https://')]
+    found = []
+    for t in tunnels:
+        url = t.get('public_url', '')
+        if not url.startswith('https://'):
+            continue
+        addr = str((t.get('config') or {}).get('addr', ''))
+        port = re.search(r':(\d+)/?$', addr) or re.fullmatch(r'(\d+)', addr)
+        found.append({'host': urlsplit(url).netloc, 'port': int(port.group(1)) if port else None})
+    return found
 
 
 class Remote:
@@ -362,7 +381,8 @@ class Handler(BaseHTTPRequestHandler):
         """Who to count failures against: through a tunnel everyone is 127.0.0.1, so use the forwarded address."""
         if self.from_this_mac():
             for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP', 'X-Forwarded-For'):
-                value = (self.headers.get(header) or '').split(',')[0].strip()
+                # The last X-Forwarded-For entry is the one the local tunnel appended; earlier ones are the sender's.
+                value = (self.headers.get(header) or '').split(',')[-1].strip()
                 if value:
                     return 'fwd:' + value[:64]
         return self.client
@@ -521,7 +541,8 @@ class Handler(BaseHTTPRequestHandler):
     def remote_info(self):
         lan, tailnet = interface_addresses()
         return {**self.server.remote.settings(), 'devices': self.server.remote.list(), 'urls': self.server.pair_urls(),
-                'lan_addresses': lan, 'tailscale_addresses': tailnet, 'ngrok': ngrok_hosts(), 'port': self.server.port}
+                'lan_addresses': lan, 'tailscale_addresses': tailnet, 'ngrok': ngrok_hosts(), 'port': self.server.port,
+                'tunnel_port': PUBLIC_PORT}
 
     def local_action(self, method, params):
         remote = self.server.remote
