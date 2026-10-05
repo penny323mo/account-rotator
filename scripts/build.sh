@@ -30,6 +30,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>io.account-rotator.app</string>
+<key>CFBundleDevelopmentRegion</key><string>zh_HK</string>
+<key>CFBundleLocalizations</key><array><string>zh-Hant</string><string>zh-HK</string><string>en</string></array>
 <key>CFBundleName</key><string>Account Rotator</string>
 <key>CFBundleDisplayName</key><string>Account Rotator</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>

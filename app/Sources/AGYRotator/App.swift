@@ -52,6 +52,7 @@ struct CodexWatch: Decodable, Sendable {
 }
 struct Snapshot: Decodable, Sendable {
     let active: String?
+    let recommended: String?
     let profiles: [String: Profile]
     let config: Config
     let revision: Int
@@ -93,6 +94,7 @@ struct CodexState: Decodable, Sendable {
     let switching: Bool
     let auto: Bool
     let autocontinue: Bool?
+    let recommended: String?
 }
 /// Claude rows give reset_at as text (Codex: a number), so they get their own lenient shape.
 struct ClaudeWindow: Decodable, Sendable { let remaining_percent: Double? }
@@ -106,7 +108,10 @@ struct ClaudeRow: Decodable, Sendable {
 struct ClaudeState: Decodable, Sendable {
     let profiles: [String: ClaudeRow]
     let active: String?
+    let recommended: String?
 }
+/// Any result whose content the caller does not need.
+struct Done: Decodable, Sendable {}
 struct RPCError: Decodable, Error { let message: String }
 struct Envelope<T: Decodable>: Decodable { let result: T?; let error: RPCError? }
 struct Accepted: Decodable, Sendable { let accepted: Bool }
@@ -197,6 +202,20 @@ enum API {
             let request = try API.request("enabled.set", params: ["enabled": value])
             snapshot = try await Task.detached { try API.call(request, as: Snapshot.self) }.value
         } catch { self.error = describe(error) }
+    }
+    /// Switch one tool to `label`. Antigravity waits for agy to go idle when it is working, else switches now.
+    func use(_ provider: String, _ label: String, working: Bool) async {
+        acting = true
+        defer { acting = false }
+        let method = ["gemini": "use", "codex": "codex.use", "claude": "claude.use"][provider] ?? "use"
+        var params: [String: Any] = ["label": label]
+        if provider == "gemini" { params[working ? "wait_idle" : "now"] = true }
+        do {
+            let request = try API.request(method, params: params)
+            _ = try await Task.detached { try API.call(request, as: Done.self) }.value
+            error = ""
+        } catch { self.error = describe(error) }
+        await load()
     }
     func refresh() async {
         do {
@@ -305,111 +324,173 @@ struct UsageBar: View {
     }
 }
 
-struct AccountLine: View {
-    let label: String
-    let email: String?
+/// Liquid Glass on macOS 26 and later (when built with its SDK), frosted material before that.
+extension View {
+    @ViewBuilder func glassCard(_ radius: CGFloat) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            self.glassEffect(.regular, in: .rect(cornerRadius: radius))
+        } else {
+            self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
+        #else
+        self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        #endif
+    }
+    @ViewBuilder func glassButton(circle: Bool = false) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            self.buttonStyle(.glass).buttonBorderShape(circle ? .circle : .capsule)
+        } else {
+            self.roundedButton(circle)
+        }
+        #else
+        self.roundedButton(circle)
+        #endif
+    }
+    @ViewBuilder func roundedButton(_ circle: Bool) -> some View {
+        if #available(macOS 14, *) {
+            self.buttonStyle(.bordered).buttonBorderShape(circle ? .circle : .capsule)
+        } else {
+            self.buttonStyle(.bordered)
+        }
+    }
+}
+
+/// Working / idle light, as on the console's cards.
+struct ActivityLight: View {
+    let working: Bool?
+    var body: some View {
+        if let working {
+            HStack(spacing: 4) {
+                Circle().fill(working ? Color.red : Color.blue).frame(width: 6, height: 6)
+                    .shadow(color: (working ? Color.red : Color.blue).opacity(0.6), radius: 2)
+                Text(working ? "工作中" : "閒置").font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(working ? Color.red : Color.blue)
+            }
+        }
+    }
+}
+
+/// One tool: the live account's 5 h and weekly usage, its activity, and a switch to the recommended next account
+/// (tapped twice: the first tap asks, so a stray click never closes anything).
+struct ProviderCard: View {
+    let title: String
+    let label: String?
     let five: Double?
     let weekly: Double?
-    let active: Bool
     let working: Bool?
-    var spent: Bool { (weekly ?? 1) <= 0 }
-    func meter(_ title: String, _ value: Double?) -> some View {
+    let next: String?
+    let busy: Bool
+    let action: (String) -> Void
+    @State private var armed = false
+
+    func gauge(_ name: String, _ value: Double?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                Text(title).font(.system(size: 9)).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(name).font(.system(size: 10, design: .rounded)).foregroundStyle(.secondary)
                 Spacer(minLength: 0)
-                Text(value.map { "\(Int($0.rounded()))%" } ?? "—").font(.system(size: 11, weight: .semibold).monospacedDigit())
+                Text(value.map { "\(Int($0.rounded()))%" } ?? "—")
+                    .font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
             }
             UsageBar(value: value)
-        }.frame(width: 78)
+        }
     }
     var body: some View {
-        HStack(spacing: 10) {
-            Circle().fill(active ? Color.green : Color.clear).overlay(Circle().stroke(Color.primary.opacity(active ? 0 : 0.2)))
-                .frame(width: 8, height: 8).shadow(color: active ? .green.opacity(0.7) : .clear, radius: 3)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(label).font(.system(size: 12, weight: .semibold))
-                    if active, let working {
-                        Text(working ? "工作中" : "閒置").font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(working ? Color.red : Color.blue)
-                    } else if spent {
-                        Text("每週已用盡").font(.system(size: 9)).foregroundStyle(.secondary)
-                    }
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
+                    Text(title).font(.system(size: 12, weight: .semibold, design: .rounded))
+                    Text(label ?? "未有帳號").font(.system(size: 11, design: .rounded)).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    ActivityLight(working: label == nil ? nil : working)
                 }
-                Text(email ?? "").font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 12) { gauge("5 小時", five); gauge("每週", weekly) }
             }
-            Spacer(minLength: 4)
-            meter("5h", five)
-            meter("每週", weekly)
+            Button {
+                guard let next else { return }
+                if armed { armed = false; action(next) } else {
+                    armed = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { armed = false }
+                }
+            } label: {
+                VStack(spacing: 1) {
+                    Image(systemName: armed ? "checkmark" : "arrow.right").font(.system(size: 12, weight: .semibold))
+                    Text(armed ? "確認" : (next.map(short) ?? "—")).font(.system(size: 10, weight: .semibold, design: .rounded))
+                }.frame(width: 40, height: 40)
+            }
+            .glassButton(circle: true)
+            .tint(armed ? .orange : nil)
+            .disabled(next == nil || busy)
+            .help(next.map { armed ? "再撳一次轉去 \($0)" : "轉去建議帳號 \($0)" } ?? "冇其他建議帳號")
+            .accessibilityLabel(next.map { "轉去建議帳號 \($0)" } ?? "冇其他建議帳號")
         }
-        .opacity(spent && !active ? 0.5 : 1)
-        .padding(.vertical, 5).padding(.horizontal, 8)
-        .background(active ? Color.green.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .glassCard(18)
+    }
+    func short(_ label: String) -> String {
+        label.split(separator: "_").last.map(String.init) ?? label
+    }
+}
+
+/// The orange three-in-one logo (the app icon), at menu bar / header size.
+enum Logo {
+    static let image: NSImage = {
+        let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap(NSImage.init(contentsOf:))
+            ?? NSApp.applicationIconImage ?? NSImage()
+        return icon
+    }()
+    static func sized(_ side: CGFloat) -> NSImage {
+        let copy = image.copy() as! NSImage
+        copy.size = NSSize(width: side, height: side)
+        return copy
     }
 }
 
 struct MenuPanel: View {
     @ObservedObject var model: Model
     let openConsole: () -> Void
-    func section<Content: View>(_ title: String, @ViewBuilder _ rows: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary).padding(.leading, 8)
-            rows()
-        }
-    }
     var body: some View {
         let s = model.snapshot
         let family = s?.config.family ?? "gemini"
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Account Rotator").font(.system(size: 13, weight: .bold))
+        let gemini = s?.active.flatMap { s?.profiles[$0] }?.groups.first { $0.family == family }?.windows
+        let codex = s?.codex?.active.flatMap { s?.codex?.profiles[$0] }
+        let claude = s?.claude?.active.flatMap { s?.claude?.profiles[$0] }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(nsImage: Logo.sized(22)).resizable().frame(width: 22, height: 22)
+                Text("Account Rotator").font(.system(size: 13, weight: .bold, design: .rounded))
                 Spacer()
                 Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 7, height: 7)
-                Text(model.connected ? "已連接" : "連線中斷").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(model.connected ? "已連接" : "連線中斷").font(.system(size: 10, design: .rounded)).foregroundStyle(.secondary)
+            }.padding(.horizontal, 4)
+            ProviderCard(title: "Antigravity", label: s?.active, five: gemini?["5h"]?.remaining_percent,
+                         weekly: gemini?["weekly"]?.remaining_percent, working: s?.activity?["gemini"]?.working,
+                         next: s?.recommended, busy: model.acting) { label in
+                Task { await model.use("gemini", label, working: s?.activity?["gemini"]?.working == true) }
             }
-            section("Antigravity") {
-                ForEach((s?.profiles ?? [:]).keys.sorted(), id: \.self) { label in
-                    let p = s?.profiles[label]
-                    let w = p?.groups.first { $0.family == family }?.windows
-                    AccountLine(label: label.replacingOccurrences(of: "GEMINI_", with: ""), email: p?.email,
-                                five: w?["5h"]?.remaining_percent, weekly: w?["weekly"]?.remaining_percent,
-                                active: label == s?.active, working: s?.activity?["gemini"]?.working)
-                }
+            ProviderCard(title: "Codex", label: s?.codex?.active, five: codex?.five?.remaining_percent,
+                         weekly: codex?.weekly?.remaining_percent, working: s?.activity?["codex"]?.working,
+                         next: s?.codex?.recommended, busy: model.acting) { label in
+                Task { await model.use("codex", label, working: false) }
             }
-            section("Codex") {
-                ForEach((s?.codex?.profiles ?? [:]).keys.sorted(), id: \.self) { label in
-                    let r = s?.codex?.profiles[label]
-                    AccountLine(label: label.replacingOccurrences(of: "CODEX_", with: ""), email: r?.email,
-                                five: r?.five?.remaining_percent, weekly: r?.weekly?.remaining_percent,
-                                active: label == s?.codex?.active, working: s?.activity?["codex"]?.working)
-                }
+            ProviderCard(title: "Claude Code", label: s?.claude?.active, five: claude?.five?.remaining_percent,
+                         weekly: claude?.weekly?.remaining_percent, working: s?.activity?["claude"]?.working,
+                         next: s?.claude?.recommended, busy: model.acting) { label in
+                Task { await model.use("claude", label, working: false) }
             }
-            section("Claude Code") {
-                ForEach((s?.claude?.profiles ?? [:]).keys.sorted(), id: \.self) { label in
-                    let r = s?.claude?.profiles[label]
-                    AccountLine(label: label.replacingOccurrences(of: "CLAUDE_", with: ""), email: r?.email,
-                                five: r?.five?.remaining_percent, weekly: r?.weekly?.remaining_percent,
-                                active: label == s?.claude?.active, working: s?.activity?["claude"]?.working)
-                }
-            }
-            Divider()
-            HStack {
-                Text("自動輪轉（Antigravity）").font(.system(size: 12))
-                Spacer()
-                Toggle("自動輪轉（Antigravity）", isOn: Binding(get: { s?.config.enabled ?? false },
-                                         set: { value in Task { await model.enabled(value) } }))
-                    .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(!model.connected || model.acting)
+            if !model.error.isEmpty {
+                Text(model.error).font(.system(size: 10, design: .rounded)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 4)
             }
             HStack {
-                Button("開啟控制台", action: openConsole).keyboardShortcut("o")
-                Button("配對手機") { RemoteRequest.ask(); openConsole() }
-                Button("更新用量") { Task { await model.refresh() } }
+                Button("開啟應用程式", action: openConsole).keyboardShortcut("o").glassButton()
                 Spacer()
-                Button("結束") { NSApp.terminate(nil) }.keyboardShortcut("q")
-            }.controlSize(.small)
+                Button("結束") { NSApp.terminate(nil) }.keyboardShortcut("q").glassButton()
+            }.font(.system(size: 12, design: .rounded)).padding(.top, 2)
         }
-        .padding(14).frame(width: 380)
+        .padding(12).frame(width: 330)
+        .environment(\.locale, Locale(identifier: "zh-Hant-HK"))  // Traditional Chinese glyphs, never a fallback serif
     }
 }
 
@@ -502,6 +583,33 @@ struct ConsoleWindow: View {
             }
             Darwin.exit(0)
         }
+        if let i = CommandLine.arguments.firstIndex(of: "--preview-menu"), i + 1 < CommandLine.arguments.count {
+            // A real (offscreen) window, so Liquid Glass and native buttons render, captured to a PNG.
+            let path = CommandLine.arguments[i + 1]
+            MainActor.assumeIsolated {
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                let probe = Model()
+                var done = false
+                Task { await probe.load(); done = true }
+                while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+                let host = NSHostingView(rootView: MenuPanel(model: probe) {})
+                host.frame = NSRect(origin: .zero, size: host.fittingSize)
+                let effect = NSVisualEffectView(frame: host.frame)
+                effect.material = .popover; effect.state = .active; effect.blendingMode = .behindWindow
+                effect.addSubview(host)
+                let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: host.frame.width, height: host.frame.height),
+                                      styleMask: [.borderless], backing: .buffered, defer: false)
+                window.contentView = effect
+                window.orderFrontRegardless()
+                RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+                if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(window.windowNumber), [.bestResolution]),
+                   let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: path)); print("preview: \(path)")
+                } else { print("preview: FAIL") }
+            }
+            Darwin.exit(0)
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot-web"), i + 1 < CommandLine.arguments.count {
             WebSnapshot.run(to: CommandLine.arguments[i + 1])
         }
@@ -530,7 +638,7 @@ struct ConsoleWindow: View {
         MenuBarExtra {
             MenuPanel(model: model) { openWindow(id: "dashboard"); NSApp.activate(ignoringOtherApps: true) }
         } label: {
-            Text("AG \(model.snapshot?.active?.replacingOccurrences(of: "GEMINI_", with: "") ?? "–") · CX \(model.snapshot?.codex?.active?.replacingOccurrences(of: "CODEX_", with: "") ?? "–") · CL \(model.snapshot?.claude?.active?.replacingOccurrences(of: "CLAUDE_", with: "") ?? "–")")
+            Image(nsImage: Logo.sized(18))
                 .task {
                     while !Task.isCancelled {
                         await model.load()
