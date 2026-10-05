@@ -232,6 +232,82 @@ class RemoteTests(unittest.TestCase):
                          'abc.ngrok-free.app')
 
 
+class TunnelTests(RemoteTests):
+    """Tunnels (ngrok, cloudflared, Caddy) connect from this Mac: they must never pass for this Mac."""
+    def setUp(self):
+        super().setUp()
+        self.tunnel = web.Server(0, '', self.home.name, self.server.caller, remote=self.server.remote,
+                                 always_remote=True)
+        self.tunnel.csrf = self.server.csrf
+        threading.Thread(target=self.tunnel.serve_forever, daemon=True).start()
+        self.addCleanup(self.tunnel.server_close)
+        self.addCleanup(self.tunnel.shutdown)
+
+    def test_host_rewritten_to_localhost_with_a_proxy_header_is_remote(self):
+        # Refused outright (127.0.0.1 is not a remote address); tunnels belong on the tunnel port.
+        local = f'127.0.0.1:{self.port}'
+        for header in ('X-Forwarded-For', 'Forwarded', 'Via', 'CF-Connecting-IP', 'X-Real-IP', 'X-Forwarded-Host'):
+            self.assertEqual(self.request(headers={'Host': local, header: '203.0.113.9'})[0], 403, header)
+            self.assertEqual(self.request(path='/agy/', headers={'Host': local, header: '203.0.113.9'})[0], 403, header)
+            self.assertEqual(self.request('POST', '/agy/api/action', json.dumps({'method': 'refresh'}),
+                                          {'Host': local, header: '203.0.113.9', 'Content-Type': 'application/json',
+                                           'X-AGY-CSRF': self.server.csrf})[0], 403, header)
+        self.assertEqual(self.calls, [])
+
+    def test_tunnel_port_is_always_remote_even_with_a_rewritten_host(self):
+        port = self.tunnel.server_address[1]
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+        conn.request('GET', '/agy/api/status', headers={'Host': f'127.0.0.1:{port}'})
+        self.assertEqual(conn.getresponse().status, 401)
+        conn.close()
+        code = self.local('pair.start')[1]['result']['code']
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+        conn.request('POST', '/agy/api/pair', json.dumps({'code': code}),
+                     {'Content-Type': 'application/json', 'Host': f'127.0.0.1:{port}', 'Origin': f'https://{self.PUBLIC}'})
+        res = conn.getresponse()
+        self.assertEqual(res.status, 200)
+        self.assertIn('Secure', res.getheader('Set-Cookie'))
+        conn.close()
+        self.assertEqual(self.calls, [])
+
+    def test_strangers_cannot_lock_out_a_paired_phone(self):
+        cookie = self.paired()
+        for _ in range(web.FAILURES + 3):
+            self.request(
+                'POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                {'Content-Type': 'application/json', 'Host': self.PUBLIC, 'X-Forwarded-For': '198.51.100.7'})
+        status = self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                              {'Content-Type': 'application/json', 'Host': self.PUBLIC, 'X-Forwarded-For': '198.51.100.7'})[0]
+        self.assertEqual(status, 429)                      # the stranger is limited ...
+        self.assertEqual(self.phone(cookie), 200)          # ... the paired phone is not
+        status = self.request('POST', '/agy/api/pair', json.dumps({'code': 'WRONG'}),
+                              {'Content-Type': 'application/json', 'Host': self.PUBLIC, 'X-Forwarded-For': '192.0.2.4'})[0]
+        self.assertEqual(status, 403)                      # another visitor is counted separately
+
+    def test_a_used_cookie_is_sent_again(self):
+        cookie = self.paired()
+        _, headers, _ = self.request(headers={'Host': self.PUBLIC, 'Cookie': cookie})
+        self.assertTrue(headers['Set-Cookie'].startswith(cookie))
+
+    def test_sign_in_details_only_with_full_control(self):
+        cookie = self.paired()
+        self.server.caller = lambda m, p: {'revision': 1, 'enrolling': {'url': 'https://sign.in/x', 'code': 'ABCD'}}
+        _, _, body = self.request(headers={'Host': self.PUBLIC, 'Cookie': cookie})
+        self.assertNotIn('enrolling', json.loads(body)['status'])
+        self.local('remote.set', {'full': True})
+        _, _, body = self.request(headers={'Host': self.PUBLIC, 'Cookie': cookie})
+        self.assertIn('enrolling', json.loads(body)['status'])
+
+    def test_turning_remote_on_or_off_restarts_for_the_tunnel_port(self):
+        self.assertTrue(self.local('remote.set', {'enabled': False})[1]['result']['restarting'])
+
+
+class RemoteOffProxyTests(WebTests):
+    def test_with_remote_off_a_proxy_header_changes_nothing(self):
+        # Off means exactly the old behaviour (an existing Caddy in front keeps working).
+        self.assertEqual(self.request(headers={'X-Forwarded-For': '203.0.113.9'})[0], 200)
+
+
 class RemoteOffTests(unittest.TestCase):
     def test_off_by_default_listens_on_loopback_only(self):
         with tempfile.TemporaryDirectory() as home:

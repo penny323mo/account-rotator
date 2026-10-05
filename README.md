@@ -107,7 +107,7 @@ shown address on the phone and type the code. A code works once, within 5 minute
 |---|---|
 | 同一個 Wi-Fi · Same Wi-Fi | 開「同一個 Wi-Fi」。普通 HTTP、冇加密：只喺屋企 Wi-Fi 用。· Turn on 同一個 Wi-Fi. Plain HTTP: home Wi-Fi only. |
 | Tailscale | Mac 同手機都裝 Tailscale 並登入同一個帳號，再開「Tailscale」。出街都用到，連線由 Tailscale 加密。· Install Tailscale on both and sign in to the same account, then turn on Tailscale. Works anywhere, encrypted by Tailscale. |
-| 自己嘅公開網址 · Your own public address | 用 ngrok、cloudflared 之類將 tunnel 指去 `127.0.0.1:3082`，再將佢嘅網址填入「公開網址」（偵測到 ngrok 會自動提議）。· Point an ngrok / cloudflared tunnel at `127.0.0.1:3082` and enter its address (a running ngrok is detected). |
+| 自己嘅公開網址 · Your own public address | 用 ngrok、cloudflared 之類將 tunnel 指去 **`127.0.0.1:3083`**（唔係 3082），再將佢嘅網址填入「公開網址」（偵測到 ngrok 會自動提議），例如 `ngrok http 3083`。· Point an ngrok / cloudflared tunnel at **`127.0.0.1:3083`** (not 3082) and enter its address (a running ngrok is detected), e.g. `ngrok http 3083`. |
 
 - 配對咗嘅手機預設只可以睇用量、轉帳號同暫停，睇唔到帳號 email。想用手機加帳號、改設定，要喺 Mac 開「手機可以加帳號、改設定」。
   配對同移除裝置永遠只可以喺 Mac 做。
@@ -116,6 +116,10 @@ shown address on the phone and type the code. A code works once, within 5 minute
 - 配對咗嘅手機就等於你本人：手機唔見咗，即刻喺 Mac 嘅「已配對裝置」移除佢。90 日冇用過嘅裝置會自動失效。
   A paired phone acts as you: if it is lost, remove it on the Mac right away. Devices unused for 90 days expire.
 - 用公開網址嘅話，ngrok 一類 tunnel 服務會睇到經過嘅內容。· With a public address, the tunnel service can see the traffic.
+- 3083 係專畀 tunnel 用嘅 port：經佢入嚟嘅一律當遠端，要配對先用得。**唔好將 tunnel 指去 3082**；經 proxy 或 tunnel 入嚟嘅 request（帶
+  `X-Forwarded-For`、`Forwarded`、`Via` 之類）喺 3082 會被拒絕。
+  Port 3083 is for tunnels: everything arriving there is remote and needs pairing. **Do not point a tunnel at 3082**;
+  proxied requests (with `X-Forwarded-For`, `Forwarded`, `Via` …) are refused there.
 
 ## 安全 · Security
 

@@ -47,6 +47,10 @@ FAILURE_WINDOW = 60          # ... per minute
 CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ'  # no 0/O, 1/I/L, U: easy to type
 HOST = re.compile(r'^[a-z0-9.-]{1,253}(:[0-9]{1,5})?$')
 TAILNET = ipaddress.ip_network('100.64.0.0/10')
+PUBLIC_PORT = 3083           # tunnels point here: everything on this port is remote, whatever its headers say
+# Any of these means the request came through a proxy or tunnel (a browser on this Mac never sends them).
+PROXY_HEADERS = ('X-Forwarded-For', 'X-Forwarded-Host', 'X-Forwarded-Proto', 'Forwarded', 'Via',
+                 'CF-Connecting-IP', 'X-Real-IP', 'True-Client-IP', 'Tailscale-User-Login')
 
 
 def wire(value):
@@ -58,12 +62,13 @@ def wire(value):
     return value
 
 
-def without_email(value):
-    """A status for a paired device: account e-mail addresses are left out."""
+def without_email(value, full=False):
+    """What a paired device gets: no account e-mail addresses, and (unless full control is on, which may add
+    accounts from the phone) no sign-in link or device code of an account being added."""
     if isinstance(value, dict):
-        return {k: without_email(v) for k, v in value.items() if k != 'email'}
+        return {k: without_email(v, full) for k, v in value.items() if k != 'email' and (full or k != 'enrolling')}
     if isinstance(value, list):
-        return [without_email(v) for v in value]
+        return [without_email(v, full) for v in value]
     return value
 
 
@@ -223,12 +228,14 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, public_host, root, caller=None, bind='127.0.0.1', restart=None, remote=None):
+    def __init__(self, port, public_host, root, caller=None, bind='127.0.0.1', restart=None, remote=None,
+                 always_remote=False):
         self.root = root
         self.caller = caller or (lambda method, params: rpc(root, method, params))
         self.csrf = secrets.token_urlsafe(32)
         self.slots = threading.BoundedSemaphore(16)
         self.remote = remote or Remote(root)
+        self.always_remote = always_remote  # the tunnel port
         self.restart = restart or (lambda: threading.Timer(0.5, os._exit, (0,)).start())  # launchd starts us again
         super().__init__((bind, port), Handler)
         actual = self.server_address[1]
@@ -312,6 +319,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if cookie is None and getattr(self, 'refresh_cookie', None):
+            cookie = self.device_cookie(self.refresh_cookie)
         if cookie:
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
@@ -333,18 +342,36 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def proxied(self):
+        return any(self.headers.get(h) is not None for h in PROXY_HEADERS)
+
     @property
     def local(self):
         """Made on this Mac to 127.0.0.1 / localhost (or the legacy --public-host while remote control is off).
-        A proxy (ngrok, Caddy, tailscale serve) connects from this Mac too but with its own Host, so it is remote; a
-        Wi-Fi client never passes the loopback test, whatever Host it sends."""
-        return self.from_this_mac() and self.headers.get('Host') in self.server.hosts and not (
+        A Wi-Fi client never passes the loopback test, whatever Host it sends. A tunnel or proxy connects from this
+        Mac too and may rewrite Host to 127.0.0.1, so: never on the tunnel port, and never with a proxy header."""
+        if self.server.always_remote or not self.from_this_mac():
+            return False
+        if self.server.remote.settings()['enabled'] and self.proxied():
+            return False
+        return self.headers.get('Host') in self.server.hosts and not (
             self.headers.get('Host') == self.server.public_host and self.server.remote.settings()['enabled'])
+
+    @property
+    def key(self):
+        """Who to count failures against: through a tunnel everyone is 127.0.0.1, so use the forwarded address."""
+        if self.from_this_mac():
+            for header in ('CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP', 'X-Forwarded-For'):
+                value = (self.headers.get(header) or '').split(',')[0].strip()
+                if value:
+                    return 'fwd:' + value[:64]
+        return self.client
 
     @property
     def scheme(self):
         forwarded = self.headers.get('X-Forwarded-Proto') if self.from_this_mac() else None
-        if forwarded == 'https' or self.headers.get('Host') in (self.server.remote.settings()['public'], self.server.public_host):
+        if (forwarded == 'https' or self.server.always_remote or
+                self.headers.get('Host') in (self.server.remote.settings()['public'], self.server.public_host)):
             return 'https'  # public addresses are served by a TLS-terminating tunnel
         return 'http'
 
@@ -352,8 +379,13 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get('Host') or '').lower()
         if self.local:
             origins = self.server.origins
-        elif host in self.server.remote_hosts():
+        elif self.server.always_remote and not self.server.remote.settings()['enabled']:
+            self.respond(403, {'error': 'REMOTE_OFF'})
+            return False
+        elif host in self.server.remote_hosts() or (self.server.always_remote and HOST.match(host)):
             origins = {f'{self.scheme}://{host}'}
+            if self.server.always_remote:  # a tunnel that rewrites Host: the browser's Origin is the public address
+                origins |= {f'https://{h}' for h in (self.server.remote.settings()['public'], self.server.public_host) if h}
         else:
             self.respond(403, {'error': 'HOST_NOT_ALLOWED'})
             return False
@@ -363,30 +395,30 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def device(self):
-        """The paired device behind this request, or None (a presented but invalid cookie counts as a failure)."""
+    def cookie_value(self):
         jar = SimpleCookie()
         try:
             jar.load(self.headers.get('Cookie') or '')
         except Exception:
             return None
         morsel = jar.get(COOKIE)
-        if not morsel:
-            return None
-        found = self.server.remote.check(morsel.value)
-        if not found:
-            self.server.remote.failed(self.client)
-        return found
+        return morsel.value if morsel else None
 
     def gate(self, api):
-        """True when a remote request may go on; otherwise answers it (pairing page / 401 / 429)."""
+        """True when a remote request may go on; otherwise answers it (pairing page / 401 / 429). A valid device
+        cookie (256 random bits, cannot be guessed) always passes, so strangers hammering a public address cannot
+        lock out the user's own phone; only failed attempts are counted and limited."""
         if self.local:
             return True
-        if self.server.remote.limited(self.client):
+        value = self.cookie_value()
+        if value and self.server.remote.check(value):
+            self.refresh_cookie = value  # sent again, so the browser keeps it as long as it is used
+            return True
+        if self.server.remote.limited(self.key):
             self.respond(429, {'error': 'TOO_MANY_ATTEMPTS'})
             return False
-        if self.device():
-            return True
+        if value:
+            self.server.remote.failed(self.key)
         if api:
             self.respond(401, {'error': 'PAIRING_REQUIRED'})
         else:
@@ -414,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(503, {'error': 'SERVICE_UNAVAILABLE'})
                 return
             if not self.local:
-                status = without_email(status)
+                status = without_email(status, self.server.remote.settings()['full'])
             remote = {'local': self.local, 'full': self.server.remote.settings()['full']}
             self.respond(200, {'status': status, 'csrf': self.server.csrf, 'remote': remote})
             return
@@ -479,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             result = self.server.caller(method, params)
-            self.respond(200, {'result': result if self.local else without_email(result)})
+            self.respond(200, {'result': result if self.local else without_email(result, self.server.remote.settings()['full'])})
         except QuotaError as e:
             code = str(e)
             self.respond(409, {'error': code if code.replace('_', '').isalnum() else 'ACTION_FAILED'})
@@ -506,9 +538,11 @@ class Handler(BaseHTTPRequestHandler):
                 if values['public'] and not HOST.match(values['public']):
                     self.respond(400, {'error': 'INVALID_PUBLIC_ADDRESS'})
                     return
-            before = self.server.listen_addresses()
+            def listening():
+                return self.server.listen_addresses(), remote.settings()['enabled']
+            before = listening()
             remote.set(values)
-            restarting = self.server.listen_addresses() != before
+            restarting = listening() != before
             self.respond(200, {'result': {**self.remote_info(), 'restarting': restarting}})
             if restarting:
                 self.server.restart()  # listen on the new addresses
@@ -532,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.local or not remote.settings()['enabled']:
             self.respond(409, {'error': 'REMOTE_OFF' if not remote.settings()['enabled'] else 'ALREADY_LOCAL'})
             return
-        if remote.limited(self.client):
+        if remote.limited(self.key):
             self.respond(429, {'error': 'TOO_MANY_ATTEMPTS'})
             return
         try:
@@ -545,26 +579,41 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, AttributeError):
             self.respond(400, {'error': 'INVALID_REQUEST'})
             return
-        value = remote.finish(self.client, code, device_name(self.headers.get('User-Agent')))
+        value = remote.finish(self.key, code, device_name(self.headers.get('User-Agent')))
         if not value:
             self.respond(403, {'error': 'PAIRING_CODE_INVALID'})
             return
+        self.respond(200, {'result': {'paired': True}}, cookie=self.device_cookie(value))
+
+    def device_cookie(self, value):
         cookie = f'{COOKIE}={value}; Path=/agy; Max-Age={DEVICE_IDLE}; HttpOnly; SameSite=Strict'
-        if self.scheme == 'https':
-            cookie += '; Secure'
-        self.respond(200, {'result': {'paired': True}}, cookie=cookie)
+        return cookie + '; Secure' if self.scheme == 'https' else cookie
 
 
-def serve(port, public_host, home):
-    """127.0.0.1 always; while remote control is on, also each picked Wi-Fi / Tailscale address (same handler)."""
+def serve(port, public_host, home, public_port=PUBLIC_PORT):
+    """127.0.0.1 always; while remote control is on, also each picked Wi-Fi / Tailscale address and the tunnel
+    port (127.0.0.1:3083, always remote). If this Mac's addresses change (another Wi-Fi), start again on the new ones."""
     main = Server(port, public_host, home)
-    for address in main.listen_addresses():
+    started = main.listen_addresses()
+    extras = [(address, port, False) for address in started]
+    if main.remote.settings()['enabled']:
+        extras.append(('127.0.0.1', public_port, True))
+    for address, extra_port, always_remote in extras:
         try:
-            extra = Server(port, public_host, home, caller=main.caller, bind=address, remote=main.remote)
+            extra = Server(extra_port, public_host, home, caller=main.caller, bind=address, remote=main.remote,
+                           always_remote=always_remote)
         except OSError:
-            continue  # the address went away; the remaining ones still work
+            continue  # the address went away (or the port is taken); the rest still work
         extra.csrf = main.csrf
         threading.Thread(target=extra.serve_forever, daemon=True).start()
+
+    def watch():
+        while True:
+            time.sleep(60)
+            if main.listen_addresses() != started:
+                main.restart()
+                return
+    threading.Thread(target=watch, daemon=True).start()
     main.serve_forever()
 
 

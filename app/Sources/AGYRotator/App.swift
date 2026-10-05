@@ -269,13 +269,14 @@ struct WebConsole: NSViewRepresentable {
         let failed: Binding<Bool>
         var lastReload = 0
         weak var view: WKWebView?
+        private var observer: NSObjectProtocol?
         init(failed: Binding<Bool>) {
             self.failed = failed
             super.init()
-            NotificationCenter.default.addObserver(forName: RemoteRequest.notification, object: nil, queue: .main) { [weak self] _ in
-                self?.showRemote()
-            }
+            observer = NotificationCenter.default.addObserver(forName: RemoteRequest.notification, object: nil,
+                                                              queue: .main) { [weak self] _ in self?.showRemote() }
         }
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
         func showRemote() {
             guard RemoteRequest.pending, let view, !view.isLoading else { return }  // else: after the page loads
             RemoteRequest.pending = false
