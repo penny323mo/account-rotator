@@ -69,6 +69,7 @@ struct Snapshot: Decodable, Sendable {
     let gemini_events: [Event]?
     let activity: [String: Activity]?
     let warmup: [String: Bool]?
+    let claude: ClaudeState?
 }
 struct Activity: Decodable, Sendable { let working: Bool? }
 
@@ -92,6 +93,19 @@ struct CodexState: Decodable, Sendable {
     let switching: Bool
     let auto: Bool
     let autocontinue: Bool?
+}
+/// Claude rows give reset_at as text (Codex: a number), so they get their own lenient shape.
+struct ClaudeWindow: Decodable, Sendable { let remaining_percent: Double? }
+struct ClaudeRow: Decodable, Sendable {
+    let status: String?
+    let email: String?
+    let five: ClaudeWindow?
+    let weekly: ClaudeWindow?
+    enum CodingKeys: String, CodingKey { case status, email, weekly, five = "5h" }
+}
+struct ClaudeState: Decodable, Sendable {
+    let profiles: [String: ClaudeRow]
+    let active: String?
 }
 struct RPCError: Decodable, Error { let message: String }
 struct Envelope<T: Decodable>: Decodable { let result: T?; let error: RPCError? }
@@ -150,17 +164,20 @@ enum API {
     }
 }
 
-/// Accumulates one trackpad gesture; a class so every scroll event does not re-render the view.
+/// The menu bar panel's view of the daemon: the last status snapshot and whether the daemon answers.
 @MainActor final class Model: ObservableObject {
     @Published var snapshot: Snapshot?
     @Published var error = ""
     @Published var acting = false
     @Published var connected = false
     private var loading = false
+    static let mismatch = "背景服務回應格式唔啱（可能係新舊版本混用），請結束再重新打開 Account Rotator。"
 
     func describe(_ error: Error) -> String {
         if let rpc = error as? RPCError { return rpc.message }
-        return "未能連接背景服務，請執行專案 scripts/install.sh。"
+        if case ClientError.malformed = error { return Model.mismatch }
+        if error is DecodingError { return Model.mismatch }
+        return "未能連接背景服務。重新打開 Account Rotator 會自動重新啟動佢。"
     }
     func load() async {
         guard !loading else { return }
@@ -190,9 +207,6 @@ enum API {
     }
 }
 
-// Native Liquid Glass on macOS 26+, material fallback on older systems.
-
-// Same soft blue/lilac field as the web console, so the glass has something to refract.
 extension ISO8601DateFormatter {
     static let withFraction: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -201,7 +215,12 @@ extension ISO8601DateFormatter {
     }()
 }
 
-// Working / idle chip for the live account; unknown shows nothing.
+/// A transparent web view so the window's own background shows through. `drawsBackground` is not public API: set it
+/// only while WKWebView still answers to it, so a future macOS that drops it gets an opaque view instead of a crash.
+func clearBackground(_ view: WKWebView) {
+    if view.responds(to: NSSelectorFromString("setDrawsBackground:")) { view.setValue(false, forKey: "drawsBackground") }
+}
+
 struct WebConsole: NSViewRepresentable {
     static let url = URL(string: "http://127.0.0.1:3082/agy/")!
     @Binding var failed: Bool
@@ -212,7 +231,7 @@ struct WebConsole: NSViewRepresentable {
         let view = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
-        view.setValue(false, forKey: "drawsBackground")
+        clearBackground(view)
         context.coordinator.lastReload = reload
         view.load(URLRequest(url: Self.url))
         return view
@@ -347,11 +366,19 @@ struct MenuPanel: View {
                                 active: label == s?.codex?.active, working: s?.activity?["codex"]?.working)
                 }
             }
+            section("Claude Code") {
+                ForEach((s?.claude?.profiles ?? [:]).keys.sorted(), id: \.self) { label in
+                    let r = s?.claude?.profiles[label]
+                    AccountLine(label: label.replacingOccurrences(of: "CLAUDE_", with: ""), email: r?.email,
+                                five: r?.five?.remaining_percent, weekly: r?.weekly?.remaining_percent,
+                                active: label == s?.claude?.active, working: s?.activity?["claude"]?.working)
+                }
+            }
             Divider()
             HStack {
                 Text("自動輪轉（Antigravity）").font(.system(size: 12))
                 Spacer()
-                Toggle("", isOn: Binding(get: { s?.config.enabled ?? false },
+                Toggle("自動輪轉（Antigravity）", isOn: Binding(get: { s?.config.enabled ?? false },
                                          set: { value in Task { await model.enabled(value) } }))
                     .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(!model.connected || model.acting)
             }
@@ -387,7 +414,7 @@ enum WebSnapshot {
     static func run(to path: String) -> Never {
         _ = NSApplication.shared
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 460, height: 940))
-        view.setValue(false, forKey: "drawsBackground")
+        clearBackground(view)
         let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = view
         view.load(URLRequest(url: WebConsole.url))
@@ -461,7 +488,7 @@ struct ConsoleWindow: View {
         if CommandLine.arguments.contains("--verify-api") {
             do {
                 let snapshot = try API.call(API.request("status"), as: Snapshot.self)
-                print("Swift socket + schema: PASS; activity gemini=\(snapshot.activity?["gemini"]?.working.map { $0 ? "working" : "idle" } ?? "unknown") codex=\(snapshot.activity?["codex"]?.working.map { $0 ? "working" : "idle" } ?? "unknown"); codex_events=\(snapshot.codex_events?.count ?? 0) gemini_events=\(snapshot.gemini_events?.count ?? 0) watches=\(snapshot.codex_watches?.count ?? 0); profiles=\(snapshot.profiles.count); active=\(snapshot.active ?? "UNKNOWN"); auto=\(snapshot.config.enabled); codex=\(snapshot.codex?.profiles.count ?? 0) active=\(snapshot.codex?.active ?? "UNKNOWN") auto=\(snapshot.codex?.auto ?? false) emails=\(snapshot.codex?.profiles.values.filter { $0.email != nil }.count ?? 0)")
+                print("Swift socket + schema: PASS; activity gemini=\(snapshot.activity?["gemini"]?.working.map { $0 ? "working" : "idle" } ?? "unknown") codex=\(snapshot.activity?["codex"]?.working.map { $0 ? "working" : "idle" } ?? "unknown"); codex_events=\(snapshot.codex_events?.count ?? 0) gemini_events=\(snapshot.gemini_events?.count ?? 0) watches=\(snapshot.codex_watches?.count ?? 0); profiles=\(snapshot.profiles.count); active=\(snapshot.active ?? "UNKNOWN"); auto=\(snapshot.config.enabled); codex=\(snapshot.codex?.profiles.count ?? 0) active=\(snapshot.codex?.active ?? "UNKNOWN") auto=\(snapshot.codex?.auto ?? false) emails=\(snapshot.codex?.profiles.values.filter { $0.email != nil }.count ?? 0); claude=\(snapshot.claude?.profiles.count ?? 0) active=\(snapshot.claude?.active ?? "UNKNOWN")")
                 Darwin.exit(0)
             } catch {
                 print("Swift socket + schema: FAIL")
@@ -472,7 +499,7 @@ struct ConsoleWindow: View {
             print("services: \(Services.ensure())")
             Darwin.exit(0)
         }
-        Task { @MainActor in Services.start() }
+        Services.start()
     }
     var body: some Scene {
         Window("Account Rotator", id: "dashboard") {
@@ -483,7 +510,7 @@ struct ConsoleWindow: View {
         MenuBarExtra {
             MenuPanel(model: model) { openWindow(id: "dashboard"); NSApp.activate(ignoringOtherApps: true) }
         } label: {
-            Text("AG \(model.snapshot?.active?.replacingOccurrences(of: "GEMINI_", with: "") ?? "?") · CX \(model.snapshot?.codex?.active?.replacingOccurrences(of: "CODEX_", with: "") ?? "?")")
+            Text("AG \(model.snapshot?.active?.replacingOccurrences(of: "GEMINI_", with: "") ?? "–") · CX \(model.snapshot?.codex?.active?.replacingOccurrences(of: "CODEX_", with: "") ?? "–") · CL \(model.snapshot?.claude?.active?.replacingOccurrences(of: "CLAUDE_", with: "") ?? "–")")
                 .task {
                     while !Task.isCancelled {
                         await model.load()
