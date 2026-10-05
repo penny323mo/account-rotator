@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""codex-account — switch the ChatGPT account used by Codex CLI (and the Codex inside ChatGPT.app).
+
+Mechanism (verified against openai/codex source, codex-cli 0.156.1, macOS):
+  Codex keeps its login in $CODEX_HOME/auth.json (default ~/.codex, file store is the default).
+  A process reads it once at start. Before refreshing, a running Codex re-reads auth.json and
+  skips the refresh when the account id on disk differs, so it never writes its old account back;
+  it keeps its in-memory account until restarted (access tokens last ~10 days).
+
+  Refresh tokens are single-use (`refresh_token_reused`), so every account has exactly one live copy:
+  the enrolled copy in the Keychain (service "codex-account-broker", account <LABEL>) while inactive,
+  or $CODEX_HOME/auth.json while active. `use` saves the live file back into its profile first, so
+  tokens Codex rotated are kept. This tool never refreshes tokens itself.
+
+  Secrets move only through `security -i` stdin and the 0600 auth.json; never argv, stdout or logs.
+  Metadata stores labels + hashed ids only.
+"""
+import argparse, base64, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, zlib
+import urllib.error, urllib.request
+from pathlib import Path
+
+STORE_SVC = "codex-account-broker"
+HOME = os.path.expanduser(os.environ.get("CODEX_ACCOUNT_HOME", "~/.codex-account"))
+META = os.path.join(HOME, "profiles.json")
+SEC = "/usr/bin/security"
+CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+QUOTA_MARKERS = ("usage limit", "rate limit", "Rate limit", "429", "quota", "Quota")
+WINDOWS = {18000: "5h", 604800: "weekly"}
+# `security -i` splits command lines longer than ~4090 bytes; the value must stay well below.
+MAX_VALUE = 3900
+
+
+class UsageError(Exception):
+    """Constant, non-sensitive error codes only."""
+
+
+# ---------- keychain (secret values never leave these functions except as return values) ----------
+def kc_read(label):
+    r = subprocess.run([SEC, "find-generic-password", "-s", STORE_SVC, "-a", label, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_write(label, value):
+    # `security -i` reads the command from stdin, so the secret is not visible in `ps`.
+    if any(c in value for c in " \"'\\\n"):
+        raise ValueError("unexpected characters in credential blob")
+    if len(value) >= MAX_VALUE:
+        raise ValueError("credential blob too large for `security -i`; refusing to store a truncated copy")
+    r = subprocess.run([SEC, "-i"], input=f"add-generic-password -U -s {STORE_SVC} -a {label} -w {value}\n",
+                       capture_output=True, text=True)
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        raise RuntimeError(f"keychain write failed for {STORE_SVC}/{label}")
+
+
+def kc_delete(label):
+    subprocess.run([SEC, "delete-generic-password", "-s", STORE_SVC, "-a", label], capture_output=True, text=True)
+
+
+def encode(data):
+    # Compressed: a real auth.json (two JWTs) is ~5.4 KB as plain base64, ~3.3 KB compressed.
+    return "z64:" + base64.b64encode(zlib.compress(json.dumps(data, separators=(",", ":")).encode(), 9)).decode()
+
+
+def decode(value):
+    try:
+        if value and value.startswith("z64:"):
+            return json.loads(zlib.decompress(base64.b64decode(value[4:], validate=True)))
+        if value and value.startswith("b64:"):
+            return json.loads(base64.b64decode(value[4:], validate=True))
+        return None
+    except (ValueError, TypeError, zlib.error):
+        return None
+
+
+# ---------- auth.json ----------
+def live_home():
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def read_auth(home):
+    try:
+        text = (Path(home) / "auth.json").read_text()
+    except FileNotFoundError:
+        return None, None
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        return text, None
+
+
+def write_auth(home, text):
+    fd, tmp = tempfile.mkstemp(dir=home, prefix=".auth.json.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, Path(home) / "auth.json")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def login_email(data):
+    """Email claim of the local id_token (no network); None if missing or malformed."""
+    try:
+        payload = data["tokens"]["id_token"].split(".")[1]
+        email = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("email")
+        return email if isinstance(email, str) and "@" in email and len(email) <= 254 else None
+    except Exception:
+        return None
+
+
+def identity(data):
+    """Opaque, stable id = sha256(account_id|sub), truncated. None if not a usable ChatGPT login."""
+    try:
+        tokens = data["tokens"]
+        if data.get("auth_mode") != "chatgpt" or not tokens.get("refresh_token") or not tokens.get("account_id"):
+            return None
+        payload = tokens["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return hashlib.sha256(f'{tokens["account_id"]}|{claims["sub"]}'.encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+# ---------- metadata (labels + opaque ids only, no secrets) ----------
+def load_meta():
+    try:
+        with open(META) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"profiles": {}}
+
+
+def save_meta(meta):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=HOME)
+    with os.fdopen(fd, "w") as f:
+        json.dump(meta, f, indent=2)
+        f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, META)
+
+
+def label_for(meta, ident):
+    return next((label for label, p in meta["profiles"].items() if ident and p["id"] == ident), None)
+
+
+APP_ID = "com.openai.codex"  # ChatGPT.app; it bundles its own Codex app-server
+APP_DIR = "/Applications/ChatGPT.app/"
+APP_MAIN = APP_DIR + "Contents/MacOS/ChatGPT"
+# Anchored: a process whose command line merely mentions the path (a shell, a monitor) is not ChatGPT.
+APP_MAIN_RE = "^" + APP_MAIN + "( |$)"
+
+
+def pids(*args):
+    r = subprocess.run(["pgrep", *args], capture_output=True, text=True)
+    return {int(p) for p in r.stdout.split()}
+
+
+def codex_running():
+    # Codex CLI's native binary and ChatGPT.app's bundled Codex app-server are both named `codex`.
+    return sorted(pids("-x", "codex"))
+
+
+def app_running():
+    return bool(pids("-f", APP_MAIN_RE))
+
+
+def cli_codex():
+    """Codex CLI processes only. ChatGPT.app's bundled Codex is left to ChatGPT: killing it while the app
+    quits made ChatGPT hang half-quit (2026-09-27)."""
+    found = []
+    for line in subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if cmd and os.path.basename(cmd.split()[0]) == "codex" and not cmd.startswith(APP_DIR):
+            found.append(int(pid))
+    return sorted(found)
+
+
+def close_all(wait=30):
+    """SIGTERM ChatGPT.app's main process and wait for it to exit, then SIGTERM Codex CLI. Never SIGKILL.
+    ChatGPT approves a Quit AppleEvent but never exits, while SIGTERM makes it shut down cleanly in 1-2 s
+    (2026-09-27). Its bundled Codex is left for ChatGPT to shut down. Returns (app_was_running, remaining_pids)."""
+    was_app = app_running()
+    deadline = time.time() + wait
+    for pid in pids("-f", APP_MAIN_RE):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    while app_running() and time.time() < deadline:
+        time.sleep(1)
+    if app_running():
+        return was_app, sorted(pids("-f", APP_MAIN_RE) | set(cli_codex()))
+    for pid in cli_codex():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    while cli_codex() and time.time() < deadline:
+        time.sleep(1)
+    return was_app, sorted(pids("-f", APP_MAIN_RE) | set(cli_codex()))
+
+
+def out(obj, as_json, text):
+    print(json.dumps(obj) if as_json else text)
+
+
+# ---------- commands ----------
+def cmd_enroll(a):
+    meta = load_meta()
+    _, data = read_auth(a.source or live_home())
+    ident = identity(data)
+    if not ident:
+        sys.exit("ERROR: no usable ChatGPT login found. Run `codex-account login LABEL` (or `codex login`) first.")
+    owner = label_for(meta, ident)
+    if owner and owner != a.label:
+        sys.exit(f"ERROR: this account is already enrolled as {owner}")
+    kc_write(a.label, encode(data))
+    if identity(decode(kc_read(a.label))) != ident:
+        sys.exit("ERROR: stored copy failed verification")
+    meta["profiles"][a.label] = {"id": ident, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    save_meta(meta)
+    out({"enrolled": a.label, "id": ident}, a.json, f"enrolled: {a.label} (id {ident})")
+
+
+def cmd_login(a):
+    """Sign a NEW account in without touching the live login: device-code flow in a throwaway CODEX_HOME."""
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    temp = tempfile.mkdtemp(prefix="login-", dir=HOME)
+    # Signing out of an account in the browser revoked that account's Codex tokens (seen twice, 2026-09-26),
+    # so each account signs in from a fresh private session and nothing is signed out.
+    print("Open the link below in a PRIVATE / incognito browser window and sign in with the account to add.\n"
+          "Do not sign out of any other account in your normal browser: that revokes its Codex login.\n", flush=True)
+    try:
+        os.chmod(temp, 0o700)
+        try:
+            r = subprocess.run([CODEX, "login", "--device-auth"], env={**os.environ, "CODEX_HOME": temp})
+        except KeyboardInterrupt:
+            sys.exit("\nlogin cancelled; live login untouched")
+        if r.returncode != 0:
+            sys.exit("ERROR: codex login did not complete; live login untouched")
+        cmd_enroll(argparse.Namespace(label=a.label, source=temp, json=a.json))
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+# ---------- sign in from a phone (web console): device code out, poll for completion ----------
+LABEL_RE = re.compile(r"^CODEX_[A-Z0-9_]{1,20}$")
+DEVICE_CODE_TTL = 16 * 60  # Codex device codes expire after 15 minutes
+
+
+def web_login_path():
+    return os.path.join(HOME, "web-login.json")
+
+
+def read_web_login():
+    try:
+        with open(web_login_path()) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def end_web_login(state):
+    shutil.rmtree(state["home"], ignore_errors=True)
+    try:
+        os.unlink(web_login_path())
+    except FileNotFoundError:
+        pass
+
+
+def cmd_login_start(a):
+    if not LABEL_RE.match(a.label):
+        sys.exit("ERROR: label must look like CODEX_C")
+    state = read_web_login()
+    if state and time.time() - state["started"] < DEVICE_CODE_TTL:
+        sys.exit("ERROR: another sign-in is already in progress; finish or cancel it first")
+    if state:
+        end_web_login(state)
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    home = tempfile.mkdtemp(prefix="login-", dir=HOME)
+    os.chmod(home, 0o700)
+    log_path = os.path.join(home, "login.log")
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen([CODEX, "login", "--device-auth"], env={**os.environ, "CODEX_HOME": home},
+                                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    url = code = None
+    for _ in range(30):
+        text = re.sub(r"\x1b\[[0-9;]*m", "", open(log_path, errors="replace").read())
+        url = (re.search(r"https://auth\.openai\.com/\S+", text) or [None])[0]
+        code = (re.search(r"\b[A-Z0-9]{4}-[A-Z0-9]{5}\b", text) or [None])[0]
+        if url and code:
+            break
+        time.sleep(1)
+    state = {"label": a.label, "home": home, "pid": proc.pid, "url": url, "code": code, "started": time.time()}
+    if not (url and code):
+        end_web_login(state)
+        sys.exit("ERROR: codex did not print a device code")
+    with open(web_login_path(), "w") as f:
+        json.dump(state, f)
+    out({"label": a.label, "url": url, "code": code}, a.json, f"open {url} and enter {code}")
+
+
+def same_account(label, data):
+    """The stored profile and a new login are the same ChatGPT account: same identity, or the same
+    account_id + email when OpenAI issued a new `sub` (e.g. signed in with Google instead of a password)."""
+    stored = decode(kc_read(label))
+    if identity(stored) == identity(data):
+        return True
+    try:
+        email = login_email(data)
+        return bool(email) and email == login_email(stored) and \
+            stored["tokens"]["account_id"] == data["tokens"]["account_id"]
+    except (KeyError, TypeError):
+        return False
+
+
+def cmd_login_status(a):
+    state = read_web_login()
+    if not state:
+        out({"state": "none"}, a.json, "no sign-in in progress")
+        return
+    _, data = read_auth(state["home"])
+    ident = identity(data)
+    if not ident:
+        if time.time() - state["started"] > DEVICE_CODE_TTL:
+            end_web_login(state)
+            out({"state": "failed", "error": "DEVICE_CODE_EXPIRED"}, a.json, "device code expired")
+        else:
+            out({"state": "waiting", "label": state["label"], "url": state["url"], "code": state["code"]}, a.json, "waiting")
+        return
+    meta = load_meta()
+    owner = label_for(meta, ident)
+    known = meta["profiles"].get(state["label"])
+    error = ("ALREADY_ENROLLED_AS_" + owner if owner and owner != state["label"]
+             else "DIFFERENT_ACCOUNT_FOR_LABEL" if known and known["id"] != ident
+             and not same_account(state["label"], data) else None)
+    if error:
+        end_web_login(state)
+        out({"state": "failed", "error": error}, a.json, error)
+        return
+    kc_write(state["label"], encode(data))
+    if identity(decode(kc_read(state["label"]))) != ident:
+        end_web_login(state)
+        out({"state": "failed", "error": "STORE_VERIFY_FAILED"}, a.json, "store verify failed")
+        return
+    meta["profiles"][state["label"]] = {"id": ident, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    save_meta(meta)
+    end_web_login(state)
+    out({"state": "done", "enrolled": state["label"], "id": ident}, a.json, f"enrolled {state['label']}")
+
+
+def cmd_login_cancel(a):
+    state = read_web_login()
+    if state:
+        try:
+            os.kill(state["pid"], signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        end_web_login(state)
+    out({"cancelled": bool(state)}, a.json, "cancelled" if state else "no sign-in in progress")
+
+
+def cmd_use(a):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: another account switch is in progress")
+        _cmd_use_locked(a)
+
+
+def _cmd_use_locked(a):
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    target = decode(kc_read(a.label))
+    tid = identity(target)
+    if tid != meta["profiles"][a.label]["id"]:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed; live login untouched")
+    home = live_home()
+    snapshot, live = read_auth(home)
+    if snapshot is not None and not label_for(meta, identity(live)):
+        # Its refresh token exists nowhere else; overwriting would lose the account.
+        sys.exit("ERROR: live Codex login is not enrolled; run `codex-account enroll LABEL` first")
+    reopen = reopened = False
+    try:
+        if getattr(a, "close_all", False):
+            reopen, left = close_all()
+            if left:
+                sys.exit(f"ERROR: could not stop {left} within 30s; live login untouched")
+        res = _switch(a, meta, target, tid, home)
+    finally:
+        if reopen:
+            reopened = subprocess.run(["open", "-b", APP_ID]).returncode == 0
+    res["app_reopened"] = reopened
+    out(res, a.json, f'previous: {res["previous"]}\nselected: {a.label}\nactivation: OK'
+        + (f'\nNOTE: codex running {res["codex_running"]} keeps its current account until restarted'
+           if res["codex_running"] else "")
+        + ("\nChatGPT.app reopened" if reopened else "\nWARNING: could not reopen ChatGPT.app" if reopen else ""))
+
+
+def _switch(a, meta, target, tid, home):
+    # Re-read after closing: Codex may have rotated the token right before it exited.
+    snapshot, live = read_auth(home)
+    prev = label_for(meta, identity(live))
+    if snapshot is not None and not prev:
+        sys.exit("ERROR: live Codex login is not enrolled; run `codex-account enroll LABEL` first")
+    running = codex_running()
+    if prev:
+        # Keep tokens Codex rotated while this account was live (refresh tokens are single-use).
+        kc_write(prev, encode(live))
+        if identity(decode(kc_read(prev))) != identity(live):
+            sys.exit(f"ERROR: could not save live login back into {prev}; live login untouched")
+    if prev != a.label:
+        try:
+            write_auth(home, json.dumps(target, indent=2))
+            if identity(read_auth(home)[1]) != tid:
+                raise RuntimeError("read-back verification failed")
+        except Exception:
+            recovery = "ROLLED_BACK"
+            try:
+                if snapshot is None:
+                    (home / "auth.json").unlink(missing_ok=True)
+                else:
+                    write_auth(home, snapshot)
+                if read_auth(home)[0] != snapshot:
+                    raise RuntimeError("rollback verification failed")
+            except Exception:
+                recovery = "ROLLBACK_FAILED"
+            out({"selected": None, "previous": prev, "activation": recovery,
+                 "error": "activation verification or auth.json update failed"},
+                a.json, f"activation FAILED; recovery: {recovery}; previous: {prev}")
+            sys.exit(2)
+    meta["active"] = a.label
+    save_meta(meta)
+    return {"previous": prev, "selected": a.label, "activation": "OK", "codex_running": running}
+
+
+def cmd_current(a):
+    meta = load_meta()
+    ident = identity(read_auth(live_home())[1])
+    label = label_for(meta, ident)
+    out({"active": label, "live_id": ident}, a.json, label or f"UNKNOWN (live id {ident})")
+
+
+def cmd_list(a):
+    meta = load_meta()
+    cur = label_for(meta, identity(read_auth(live_home())[1]))
+    rows = {label: {"ready": identity(decode(kc_read(label))) == p["id"], "active": label == cur}
+            for label, p in sorted(meta["profiles"].items())}
+    if a.json:
+        print(json.dumps({"active": cur, "profiles": rows}))
+    else:
+        for label, r in rows.items():
+            print(f'{"*" if r["active"] else " "} {label:10} {"READY" if r["ready"] else "BROKEN"}')
+
+
+def fetch_usage(access_token, account_id):
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + access_token, "ChatGPT-Account-Id": account_id,
+        "Accept": "application/json", "User-Agent": "codex-account"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            raise UsageError(f"HTTP_{e.code}") from None
+        try:
+            code = (json.loads(e.read(4096)).get("error") or {}).get("code")
+        except (ValueError, AttributeError, OSError):
+            code = None
+        raise UsageError("TOKEN_REVOKED" if code == "token_revoked" else "TOKEN_EXPIRED") from None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise UsageError("NETWORK_ERROR") from None
+
+
+def usage_row(payload):
+    row = {"status": "OK", "plan": payload.get("plan_type")}
+    limits = payload.get("rate_limit") or {}
+    row["limit_reached"] = bool(limits.get("limit_reached"))
+    for key, fallback in (("primary_window", "primary"), ("secondary_window", "secondary")):
+        w = limits.get(key)
+        if w:
+            used = w.get("used_percent", 0)
+            row[WINDOWS.get(w.get("limit_window_seconds"), fallback)] = {
+                "used_percent": used, "remaining_percent": max(0, 100 - used), "reset_at": w.get("reset_at")}
+    return row
+
+
+def cmd_quota(a):
+    """Read-only usage per profile. The active profile uses the live token; tokens are never refreshed."""
+    meta = load_meta()
+    live = read_auth(live_home())[1]
+    active = label_for(meta, identity(live))
+    labels = [a.label] if a.label else sorted(meta["profiles"])
+    rows = {}
+    for label in labels:
+        data = live if label == active else decode(kc_read(label))
+        try:
+            if identity(data) != meta["profiles"].get(label, {}).get("id"):
+                raise UsageError("PROFILE_BROKEN")
+            row = usage_row(fetch_usage(data["tokens"]["access_token"], data["tokens"]["account_id"]))
+        except UsageError as e:
+            row = {"status": str(e)}
+        rows[label] = {**row, "active": label == active, "email": login_email(data)}
+    if a.json:
+        print(json.dumps({"profiles": rows}))
+    else:
+        for label, r in rows.items():
+            q = lambda w: f'{r[w]["remaining_percent"]}%' if w in r else "-"
+            print(f'{"*" if r["active"] else " "} {label:10} {r["status"]:14} 5h left {q("5h"):>5}  weekly left {q("weekly"):>5}')
+
+
+# ---------- continue an interrupted thread (Codex Desktop or CLI) from the CLI ----------
+TMUX_SESSION = "codex-continue"
+
+
+def find_rollout(thread_id):
+    matches = glob.glob(str(live_home() / "sessions" / "*" / "*" / "*" / f"rollout-*-{thread_id}.jsonl"))
+    return Path(max(matches, key=os.path.getmtime)) if matches else None
+
+
+def thread_plan(path):
+    """Project, permissions and model of a thread, taken from its own rollout; later records win."""
+    plan = {"cwd": None, "roots": [], "approval": None, "sandbox": None, "model": None, "effort": None,
+            "running": False, "originator": None}
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            p = d.get("payload") or {}
+            if d.get("type") == "session_meta":
+                plan.update(cwd=p.get("cwd"), originator=p.get("originator"))
+            elif d.get("type") == "turn_context":
+                plan.update({k: v for k, v in (("cwd", p.get("cwd")), ("approval", p.get("approval_policy")),
+                                               ("sandbox", (p.get("sandbox_policy") or {}).get("type")),
+                                               ("model", p.get("model")), ("effort", p.get("effort"))) if v})
+            elif p.get("type") == "thread_settings_applied":
+                t = p.get("thread_settings") or {}
+                plan.update({k: v for k, v in (("cwd", t.get("cwd")), ("approval", t.get("approval_policy")),
+                                               ("model", t.get("model")), ("effort", t.get("reasoning_effort")),
+                                               ("roots", t.get("runtime_workspace_roots"))) if v})
+            elif p.get("type") == "task_started":
+                plan["running"] = True
+            elif p.get("type") in ("task_complete", "turn_aborted"):
+                plan["running"] = False
+    return plan
+
+
+def resume_command(plan, thread_id, prompt):
+    cmd = [CODEX, "resume", thread_id]
+    for flag, key in (("-C", "cwd"), ("-s", "sandbox"), ("-a", "approval"), ("-m", "model")):
+        if plan.get(key):
+            cmd += [flag, plan[key]]
+    if plan.get("effort"):
+        cmd += ["-c", f'model_reasoning_effort="{plan["effort"]}"']
+    for root in plan.get("roots") or []:
+        if root != plan.get("cwd"):
+            cmd += ["--add-dir", root]
+    return cmd + [prompt]
+
+
+def notify_rotator(thread, cwd, target):
+    """Ask the Account Rotator daemon to watch this resumed thread (notify + record when it stops).
+    Best effort: the resume itself does not depend on the daemon."""
+    path = os.path.expanduser("~/.agy-rotator/rotatord.sock")
+    req = {"jsonrpc": "2.0", "id": 1, "method": "codex.watch.add", "params": {"thread": thread, "cwd": cwd, "tmux": target}}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(path)
+            s.sendall(json.dumps(req).encode() + b"\n")
+            reply = json.loads(s.makefile().readline())
+        return "error" not in reply
+    except (OSError, ValueError):
+        return False
+
+
+def stop_app(wait=30):
+    """SIGTERM ChatGPT's main process only and wait for it to exit. Returns pids still alive."""
+    for pid in pids("-f", APP_MAIN_RE):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + wait
+    while app_running() and time.time() < deadline:
+        time.sleep(1)
+    return sorted(pids("-f", APP_MAIN_RE))
+
+
+def wait_cli(thread, timeout=20):
+    """True once the resumed CLI is running (it then holds the thread's writer lock)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if subprocess.run(["pgrep", "-f", f"resume {thread}"], capture_output=True).returncode == 0:
+            return True
+        time.sleep(1)
+    return False
+
+
+def cmd_continue(a):
+    """Resume a thread in tmux. If ChatGPT had to be closed for it, it is reopened on every way out (success or
+    error): an error after closing it once left the app closed for hours (2026-10-05 19:44, remote control lost)."""
+    state = {"reopen": False}
+    try:
+        _continue(a, state)
+    finally:
+        if state["reopen"] and not app_running():
+            subprocess.run(["open", "-b", APP_ID])
+
+
+def thread_busy(plan, thread):
+    """A turn is still running only if something runs it: the rollout ends with task_started AND a Codex CLI is
+    resuming this thread. A turn whose process was killed (e.g. by an account switch) is interrupted, not running."""
+    return plan["running"] and subprocess.run(["pgrep", "-f", f"resume {thread}"], capture_output=True).returncode == 0
+
+
+def _continue(a, state):
+    path = find_rollout(a.thread)
+    if not path:
+        sys.exit(f"ERROR: no Codex thread {a.thread} under {live_home()}/sessions")
+    plan = thread_plan(path)
+    if getattr(a, "model", None):
+        plan["model"] = a.model  # explicit choice beats the thread's latest settings
+    cmd = resume_command(plan, a.thread, a.prompt)
+    res = {"thread": a.thread, "cwd": plan["cwd"], "sandbox": plan["sandbox"], "approval": plan["approval"],
+           "model": plan["model"], "effort": plan["effort"], "command": shlex.join(cmd)}
+    if a.dry_run:
+        out(res, a.json, "\n".join(f"{k}: {v}" for k, v in res.items()))
+        return
+    if getattr(a, "close_app", False) and app_running():
+        state["reopen"] = True
+        if stop_app():
+            sys.exit("ERROR: could not close ChatGPT app; thread not resumed")
+    if app_running() and not a.force:
+        sys.exit("ERROR: ChatGPT app is open and may hold this thread in memory; quit it first "
+                 "(two writers would corrupt the conversation), or pass --force")
+    if thread_busy(plan, a.thread):
+        sys.exit("ERROR: this thread's last turn is still running; wait for it or interrupt it first")
+    if not plan["cwd"] or not os.path.isdir(plan["cwd"]):
+        sys.exit(f"ERROR: project directory {plan['cwd']} not found")
+    window = f"codex-{a.thread[-6:]}"
+    exists = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True).returncode == 0
+    launch = (["tmux", "new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", plan["cwd"], shlex.join(cmd)] if exists else
+              ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", window, "-c", plan["cwd"], shlex.join(cmd)])
+    r = subprocess.run(launch, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("ERROR: could not start tmux window for the resumed thread")
+    res["tmux"] = f"{TMUX_SESSION}:{window}"
+    res["watched"] = notify_rotator(a.thread, plan["cwd"], res["tmux"])
+    if state["reopen"]:
+        # The CLI now owns the thread's writer lock, so the app can come back without touching it.
+        wait_cli(a.thread)
+        res["app_reopened"] = subprocess.run(["open", "-b", APP_ID]).returncode == 0
+    out(res, a.json, f'resumed {a.thread} in {plan["cwd"]}\nwatch it: tmux attach -t {TMUX_SESSION}')
+
+
+def classify(text):
+    if "CODEX_ACCOUNT_SMOKE_OK" in text:
+        return "PASS"
+    return "PROFILE_ACTIVATED_BUT_ACCOUNT_UNAVAILABLE" if any(k in text for k in QUOTA_MARKERS) else "FAIL"
+
+
+def cmd_probe(a):
+    meta = load_meta()
+    label = label_for(meta, identity(read_auth(live_home())[1]))
+    if a.label and label != a.label:
+        sys.exit(f"ERROR: live profile is {label}, not {a.label}; run `use {a.label}` first")
+    t0 = time.time()
+    with tempfile.TemporaryDirectory() as wd:
+        try:
+            r = subprocess.run([CODEX, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+                                "Return exactly: CODEX_ACCOUNT_SMOKE_OK"], cwd=wd, capture_output=True,
+                               text=True, timeout=a.timeout, stdin=subprocess.DEVNULL)
+            code, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            code, text = 124, "timeout"
+    status = classify(text)
+    res = {"profile": label, "status": status, "exit": code, "elapsed_s": round(time.time() - t0, 1),
+           "detail": None if status == "PASS" else text.strip()[-300:]}
+    out(res, a.json, f'{label}: {status} exit={code} {res["elapsed_s"]}s'
+        + (f' detail={res["detail"]!r}' if res["detail"] else ""))
+    sys.exit(0 if status == "PASS" else 3)
+
+
+def cmd_remove(a):
+    """Forget an enrolled account: delete its stored copy and metadata (the OpenAI account is untouched)."""
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    if label_for(meta, identity(read_auth(live_home())[1])) == a.label:
+        sys.exit(f"ERROR: {a.label} is the live account; switch to another one first")
+    kc_delete(a.label)
+    del meta["profiles"][a.label]
+    save_meta(meta)
+    out({"removed": a.label}, a.json, f"removed: {a.label}")
+
+
+def cmd_warm(a):
+    """Start an idle account's usage clock with one tiny `codex exec` in a throwaway CODEX_HOME.
+    The live login is never touched; refreshed tokens (refresh tokens are single-use) are saved back."""
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    live = label_for(meta, identity(read_auth(live_home())[1])) == a.label
+    if live:
+        return _warm_exec(a, str(live_home()), None, None)
+    data = decode(kc_read(a.label))
+    tid = identity(data)
+    if tid != meta["profiles"][a.label]["id"]:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed")
+    with tempfile.TemporaryDirectory(prefix="codex-warm-") as home:
+        os.chmod(home, 0o700)
+        original = json.dumps(data)
+        write_auth(home, original)
+        _warm_exec(a, home, tid, original)
+
+
+def _warm_exec(a, home, tid, original):
+    """One tiny `codex exec` with CODEX_HOME=home. For a private copy (tid set) refreshed tokens are saved back;
+    the live home keeps its own refreshed auth.json, exactly like a normal Codex run."""
+    t0 = time.time()
+    env = {**os.environ, "CODEX_HOME": home}
+    with tempfile.TemporaryDirectory(prefix="codex-warm-cwd-") as cwd:
+        try:
+            r = subprocess.run([CODEX, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+                                "-c", 'cli_auth_credentials_store="file"', "-c", 'model_reasoning_effort="low"',
+                                "Return exactly: CODEX_ACCOUNT_SMOKE_OK"], cwd=cwd, env=env, capture_output=True,
+                               text=True, timeout=a.timeout, stdin=subprocess.DEVNULL)
+            code, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            code, text = 124, "timeout"
+        finally:
+            if tid:
+                _, after = read_auth(home)
+                if after and identity(after) == tid and json.dumps(after) != original:
+                    kc_write(a.label, encode(after))
+    status = classify(text)
+    res = {"warmed": a.label, "status": status, "exit": code, "elapsed_s": round(time.time() - t0, 1),
+           "detail": None if status == "PASS" else text.strip()[-300:]}
+    out(res, a.json, f'{a.label}: warm-up {status} exit={code} {res["elapsed_s"]}s')
+    if status != "PASS":
+        sys.exit(3)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="codex-account")
+    p.add_argument("--json", action="store_true")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("list"); sp.add_parser("current")
+    e = sp.add_parser("enroll", help="enroll the live login, or one from --source CODEX_HOME")
+    e.add_argument("label"); e.add_argument("--source")
+    lg = sp.add_parser("login", help="sign in a new account via device code without touching the live login")
+    lg.add_argument("label")
+    u = sp.add_parser("use"); u.add_argument("label")
+    u.add_argument("--close-all", action="store_true",
+                   help="quit ChatGPT.app + stop Codex CLI first, reopen the app after switching")
+    q = sp.add_parser("quota"); q.add_argument("label", nargs="?")
+    ws = sp.add_parser("login-start", help="phone sign-in: start device-code login, print URL + code")
+    ws.add_argument("label")
+    sp.add_parser("login-status", help="phone sign-in: enroll once the device login completed")
+    sp.add_parser("login-cancel", help="phone sign-in: stop and clean up")
+    co = sp.add_parser("continue", help="resume a Codex thread in its project with its own permissions and send a prompt")
+    co.add_argument("thread"); co.add_argument("--prompt", default="continue")
+    co.add_argument("--dry-run", action="store_true"); co.add_argument("--force", action="store_true")
+    co.add_argument("--model", help="override the model recorded in the thread")
+    co.add_argument("--close-app", action="store_true",
+                    help="quit ChatGPT first (SIGTERM), reopen it once the CLI holds the thread")
+    pr = sp.add_parser("probe"); pr.add_argument("label", nargs="?")
+    pr.add_argument("--timeout", type=int, default=120)
+    rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    w = sp.add_parser("warm", help="start an idle account's usage clock with one tiny prompt (live untouched)")
+    w.add_argument("label"); w.add_argument("--timeout", type=int, default=120)
+    a = p.parse_args()
+    {"list": cmd_list, "current": cmd_current, "enroll": cmd_enroll, "login": cmd_login,
+     "use": cmd_use, "quota": cmd_quota, "probe": cmd_probe, "continue": cmd_continue, "login-start": cmd_login_start,
+     "login-status": cmd_login_status, "login-cancel": cmd_login_cancel, "warm": cmd_warm, "remove": cmd_remove}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

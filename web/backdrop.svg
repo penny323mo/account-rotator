@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 390 844" preserveAspectRatio="xMidYMid slice">
+<defs>
+<linearGradient id="base" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d9ecfd"/><stop offset=".48" stop-color="#d9e8f2"/><stop offset="1" stop-color="#f5e6e7"/></linearGradient>
+<linearGradient id="ribbon" x1="0" y1="0" x2="1" y2=".7"><stop stop-color="#b7d5f4"/><stop offset=".36" stop-color="#85b6e4"/><stop offset=".6" stop-color="#b9d6ef"/><stop offset="1" stop-color="#e6d5ee"/></linearGradient>
+<linearGradient id="edge" x1="0" y1="0" x2="1" y2=".8"><stop stop-color="#f7ffff" stop-opacity=".9"/><stop offset=".5" stop-color="#ffffff" stop-opacity=".06"/><stop offset="1" stop-color="#fff" stop-opacity=".6"/></linearGradient>
+<linearGradient id="lower" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d4c6e9"/><stop offset=".45" stop-color="#cbd9f0"/><stop offset="1" stop-color="#f4e1dc"/></linearGradient>
+</defs>
+<rect width="390" height="844" fill="url(#base)"/>
+<path d="M450 -90C250 -45 302 104 165 166S-93 262 5 357 249 346 322 408 337 568 469 562L500 -90Z" fill="url(#ribbon)"/>
+<path d="M450 -90C250 -45 302 104 165 166S-93 262 5 357 249 346 322 408 337 568 469 562" fill="none" stroke="url(#edge)" stroke-width="3"/>
+<path d="M-80 457C86 354 290 483 193 598S127 729 431 729L420 900H-80Z" fill="url(#lower)"/>
+<path d="M-80 457C86 354 290 483 193 598S127 729 431 729" fill="none" stroke="url(#edge)" stroke-width="2.5"/>
+<path d="M428 130C327 153 330 233 218 267S44 311 75 350" fill="none" stroke="#ffffff" stroke-opacity=".14" stroke-width="22"/>
+</svg>

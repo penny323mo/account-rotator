@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""agy-account — switch the live Google account used by the Antigravity CLI (agy).
+
+Mechanism (verified on agy 1.2.11, macOS):
+  agy keeps its live OAuth credential in the login Keychain as a generic
+  password, service="gemini", account="antigravity" (zalando/go-keyring,
+  value "go-keyring-base64:<json>"). A NEW agy process reads it at startup.
+
+Broker model:
+  - each enrolled account is a copy of that item in the login Keychain,
+    service="agy-account-broker", account=<LABEL>
+  - `use` saves the live item back into its own profile (keeps refreshed
+    tokens), then overwrites the live item with the target profile.
+  - secrets only move through pipes / `security -i` stdin, never argv,
+    never stdout, never disk. Metadata file stores labels + hashed ids only.
+"""
+import argparse, base64, binascii, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+
+LIVE_SVC, LIVE_ACCT = "gemini", "antigravity"
+STORE_SVC = "agy-account-broker"
+HOME = os.path.expanduser(os.environ.get("AGY_ACCOUNT_HOME", "~/.agy-account"))
+META = os.path.join(HOME, "profiles.json")
+SEC = "/usr/bin/security"
+QUOTA_MARKERS = ("RESOURCE_EXHAUSTED", "429", "quota", "Quota", "MODEL_CAPACITY_EXHAUSTED",
+                 "rate limit", "exhausted")
+
+
+# ---------- keychain (secret values never leave these functions except as return values) ----------
+def kc_read(svc, acct):
+    r = subprocess.run([SEC, "find-generic-password", "-s", svc, "-a", acct, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_write(svc, acct, value):
+    # `security -i` reads the command from stdin, so the secret is not visible in `ps`.
+    if any(c in value for c in " \"'\\\n"):
+        raise ValueError("unexpected characters in credential blob")
+    cmd = f'add-generic-password -U -s {svc} -a {acct} -w {value}\n'
+    r = subprocess.run([SEC, "-i"], input=cmd, capture_output=True, text=True)
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        raise RuntimeError(f"keychain write failed for {svc}/{acct}")
+
+
+def kc_delete(svc, acct):
+    subprocess.run([SEC, "delete-generic-password", "-s", svc, "-a", acct],
+                   capture_output=True, text=True)
+
+
+# ---------- blob parsing ----------
+def decode_blob(raw):
+    if raw.startswith("go-keyring-base64:"):
+        raw = base64.b64decode(raw[len("go-keyring-base64:"):]).decode()
+    elif raw.startswith("go-keyring-encoded:"):
+        raw = binascii.unhexlify(raw[len("go-keyring-encoded:"):]).decode()
+    return json.loads(raw)
+
+
+def identity(raw):
+    """Opaque, stable account id = sha256(iss|sub) of the id_token, truncated. None if unusable."""
+    try:
+        d = decode_blob(raw)
+        if not d.get("token", {}).get("refresh_token"):
+            return None
+        payload = d["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return hashlib.sha256(f'{claims["iss"]}|{claims["sub"]}'.encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+# ---------- metadata (labels + opaque ids only, no secrets) ----------
+def load_meta():
+    try:
+        with open(META) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"profiles": {}}
+
+
+def save_meta(m):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=HOME)
+    with os.fdopen(fd, "w") as f:
+        json.dump(m, f, indent=2)
+        f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, META)
+
+
+def live_label(m):
+    lid = identity(kc_read(LIVE_SVC, LIVE_ACCT) or "")
+    for label, p in m["profiles"].items():
+        if lid and p["id"] == lid:
+            return label, lid
+    return None, lid
+
+
+def agy_running():
+    # agy CLI plus Antigravity.app (its language_server also writes the shared Keychain item)
+    pids = set()
+    for args in (["-x", "agy"], ["-f", "^/Applications/Antigravity.app/Contents/MacOS/Antigravity( |$)"]):
+        r = subprocess.run(["pgrep", *args], capture_output=True, text=True)
+        pids.update(int(p) for p in r.stdout.split())
+    return sorted(pids)
+
+
+APP = "/Applications/Antigravity.app"
+# Anything executing from the bundle: app helpers plus `language_server multicall schedule`
+# workers, which outlive a Quit (reparented to launchd) and still hold an account token.
+APP_PROCS = "^" + APP + "/"
+
+
+def app_running():
+    return subprocess.run(["pgrep", "-f", "^" + APP + "/Contents/MacOS/Antigravity( |$)"], capture_output=True).returncode == 0
+
+
+def app_procs():
+    r = subprocess.run(["pgrep", "-f", APP_PROCS], capture_output=True, text=True)
+    return {int(p) for p in r.stdout.split()}
+
+
+def stop_owned_agy():
+    """SIGTERM only agy process groups that their launcher registered (agy_ownership registry): live, and
+    start time still matching.  NEVER `pkill -x agy`: that also killed production `agy --print` research.
+    Unregistered agy (production, interactive) is left alone; close_all then reports it as remaining and the
+    switch is refused with live state untouched.  If the ownership module is unavailable: terminate nothing."""
+    try:
+        mod_dir = os.environ.get("AGY_OWNERSHIP_DIR") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "daemon")
+        if mod_dir not in sys.path:
+            sys.path.insert(0, mod_dir)
+        import agy_ownership
+        return agy_ownership.terminate_owned()
+    except Exception:
+        return None
+
+
+DRAIN_SECONDS = 20  # must equal agy_ownership.DRAIN_SECONDS: bounds how long the rotation lock is held
+
+
+def close_all(wait=DRAIN_SECONDS):
+    """Gracefully quit Antigravity.app, then SIGTERM REGISTERED agy process groups and leftover bundle
+    processes. Never SIGKILL, never an unregistered agy. Returns (app_was_running, remaining_pids)."""
+    was_app = app_running()
+    if was_app:
+        try:
+            subprocess.run(["osascript", "-e", 'quit app "Antigravity"'], capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return was_app, sorted(set(agy_running()) | app_procs())
+    stop_owned_agy()
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if not app_running():  # let the app finish its own Quit before touching bundle processes
+            subprocess.run(["pkill", "-TERM", "-f", APP_PROCS], capture_output=True)
+        if not (agy_running() or app_procs()):
+            break
+        time.sleep(1)
+    return was_app, sorted(set(agy_running()) | app_procs())
+
+
+def stop_leftovers(wait=10):
+    """SIGTERM bundle processes still running without the app (orphaned schedulers). Returns survivors."""
+    deadline = time.time() + wait
+    while app_procs() and time.time() < deadline:
+        subprocess.run(["pkill", "-TERM", "-f", APP_PROCS], capture_output=True)
+        time.sleep(1)
+    return sorted(app_procs())
+
+
+def out(obj, as_json, text):
+    print(json.dumps(obj) if as_json else text)
+
+
+# ---------- commands ----------
+def cmd_enroll(a):
+    m = load_meta()
+    raw = kc_read(LIVE_SVC, LIVE_ACCT)
+    lid = identity(raw or "")
+    if not lid:
+        sys.exit("ERROR: no valid live agy login. Run `agy`, sign in with the account, then enroll.")
+    for label, p in m["profiles"].items():
+        if p["id"] == lid and label != a.label:
+            sys.exit(f"ERROR: live account is already enrolled as {label}")
+    kc_write(STORE_SVC, a.label, raw)
+    if identity(kc_read(STORE_SVC, a.label) or "") != lid:
+        sys.exit("ERROR: stored copy failed verification")
+    m["profiles"][a.label] = {"id": lid, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    m["active"] = a.label
+    save_meta(m)
+    out({"enrolled": a.label, "id": lid}, a.json, f"enrolled: {a.label} (id {lid})")
+
+
+def cmd_logout_live(a):
+    """Prepare enrolling another account: stash live into its profile, remove live item.
+    Does NOT call agy /logout, so the enrolled refresh token is not revoked server-side."""
+    m = load_meta()
+    label, lid = live_label(m)
+    if lid and not label:
+        sys.exit("ERROR: live account is not enrolled yet; enroll it first so it is not lost")
+    if label:
+        kc_write(STORE_SVC, label, kc_read(LIVE_SVC, LIVE_ACCT))
+    kc_delete(LIVE_SVC, LIVE_ACCT)
+    m["active"] = None
+    save_meta(m)
+    print(f"live credential cleared (saved back to {label}). Now run `agy`, sign in with the NEW account, "
+          f"exit, then `agy-account enroll <LABEL>`.")
+
+
+def cmd_use(a):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: another account switch is in progress")
+        _cmd_use_locked(a)
+
+
+def _cmd_use_locked(a):
+    m = load_meta()
+    if a.label not in m["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    target = kc_read(STORE_SVC, a.label)
+    tid = identity(target or "")
+    if tid != m["profiles"][a.label]["id"]:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed; live state untouched")
+    reopen_app = False
+    try:
+        if a.close_all:
+            reopen_app, left = close_all()
+            if left and not a.force:  # --force: the live account is used up; switch even past them
+                sys.exit(f"ERROR: could not stop {left} within {DRAIN_SECONDS}s; live state untouched")
+        pids = agy_running()
+        if pids and not a.force:
+            sys.exit(f"ERROR: agy is running (pids {pids}); a running agy may write its own token back "
+                     f"over the switch. Stop it or pass --force.")
+        if not app_running():
+            left = stop_leftovers()
+            if left:
+                sys.exit(f"ERROR: could not stop leftover Antigravity processes {left}; live state untouched")
+
+        # 1. snapshot live, 2. save it back into its own profile (keeps refreshed tokens)
+        snapshot = kc_read(LIVE_SVC, LIVE_ACCT)
+        snapshot_id = identity(snapshot or "")
+        prev = next((label for label, p in m["profiles"].items() if snapshot_id and p["id"] == snapshot_id), None)
+        if prev == a.label:
+            target = snapshot  # Preserve the newer live token on same-profile selection.
+        if prev and prev != a.label:
+            kc_write(STORE_SVC, prev, snapshot)
+        # 3. atomic single-item keychain update, 4. verify, rollback on failure
+        try:
+            kc_write(LIVE_SVC, LIVE_ACCT, target)
+            if identity(kc_read(LIVE_SVC, LIVE_ACCT) or "") != tid:
+                raise RuntimeError("read-back verification failed")
+        except Exception as e:
+            rollback = "ROLLED_BACK"
+            try:
+                if snapshot:
+                    kc_write(LIVE_SVC, LIVE_ACCT, snapshot)
+                else:
+                    kc_delete(LIVE_SVC, LIVE_ACCT)
+                if kc_read(LIVE_SVC, LIVE_ACCT) != snapshot:
+                    raise RuntimeError("rollback verification failed")
+            except Exception:
+                rollback = "ROLLBACK_FAILED"
+            out({"selected": None, "previous": prev, "activation": rollback,
+                 "error": "activation verification or keychain update failed"},
+                a.json, f"activation FAILED; recovery: {rollback}; previous: {prev}")
+            sys.exit(2)
+        m["active"] = a.label
+        save_meta(m)
+        res = {"previous": prev, "selected": a.label, "activation": "OK", "agy_running": pids,
+               "app_reopened": reopen_app}
+    finally:
+        if reopen_app:
+            reopened = subprocess.run(["open", "-a", APP])
+    if reopen_app:
+        res["app_reopened"] = reopened.returncode == 0
+    out(res, a.json, f"previous: {prev}\nselected: {a.label}\nactivation: OK"
+        + (f"\nWARNING: agy running {pids}; restart it to use {a.label}" if pids else "")
+        + ("\nWARNING: account switched but app could not reopen" if reopen_app and not res["app_reopened"] else ""))
+
+
+# ---------- sign in a new account from a phone (web console): URL out, authorization code in ----------
+# agy's Google OAuth redirects to antigravity.google, which shows an authorization code that agy accepts
+# pasted into its prompt (verified 2026-09-27), so nothing has to reach this Mac's localhost.
+LOGIN_TMUX = "agy-login"
+LABEL_RE = re.compile(r"^GEMINI_[A-Z0-9_]{1,20}$")
+
+
+def login_state_path():
+    return os.path.join(HOME, "login.json")
+
+
+def no_browser_path():
+    """A PATH entry whose `open` does nothing: a signed-out agy opens the default browser by itself,
+    on top of the link the console shows, and each attempt left a sign-in tab behind."""
+    d = os.path.join(HOME, "no-browser")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    shim = os.path.join(d, "open")
+    if not os.access(shim, os.X_OK):
+        with open(shim, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(shim, 0o700)
+    return d
+
+
+def tmux_start():
+    work = os.path.join(HOME, "login-work")
+    os.makedirs(work, mode=0o700, exist_ok=True)
+    path = no_browser_path() + ":" + os.environ.get("PATH", "/usr/bin:/bin")
+    agy = shutil.which("agy") or "/opt/homebrew/bin/agy"
+    subprocess.run(["tmux", "kill-session", "-t", LOGIN_TMUX], capture_output=True)
+    # env as the command: an already running tmux server would not pass our environment on
+    subprocess.run(["tmux", "new-session", "-d", "-s", LOGIN_TMUX, "-x", "500", "-y", "60", "-c", work,
+                    "env", f"PATH={path}", "BROWSER=true", agy], capture_output=True)
+
+
+LOGIN_TAB_SCRIPT = """
+if application "%(app)s" is running then
+    tell application "%(app)s"
+        repeat with w in windows
+            repeat with i from (count of tabs of w) to 1 by -1
+                set u to URL of tab i of w
+                if u is not missing value then
+                    if u contains "client_id=%(client)s" or u starts with "https://antigravity.google/oauth-callback" then close tab i of w
+                end if
+            end repeat
+        end repeat
+    end tell
+end if
+"""
+AGY_OAUTH_CLIENT = "1071006060591"  # Antigravity's Google OAuth client id, as seen in its sign-in URLs
+
+
+def close_login_tabs():
+    """Close the Antigravity sign-in pages (Google account chooser / oauth-callback) left in the browser.
+    Best effort and in the background: osascript can wait ~15 s per browser (Automation permission), and the
+    phone console gave up on the reply ("連線失敗") while login-finish waited for it. A browser that is not
+    running is not started; a refused permission is ignored."""
+    for app in ("Safari", "Google Chrome"):
+        try:
+            subprocess.Popen(["osascript", "-e", LOGIN_TAB_SCRIPT % {"app": app, "client": AGY_OAUTH_CLIENT}],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass
+
+
+def tmux_capture():
+    return subprocess.run(["tmux", "capture-pane", "-p", "-J", "-t", LOGIN_TMUX],
+                          capture_output=True, text=True).stdout
+
+
+def tmux_send(keys, literal=False):
+    subprocess.run(["tmux", "send-keys", "-t", LOGIN_TMUX] + (["-l"] if literal else []) + [keys], capture_output=True)
+
+
+def tmux_stop():
+    subprocess.run(["tmux", "kill-session", "-t", LOGIN_TMUX], capture_output=True)
+
+
+def wait_screen(predicate, seconds=40):
+    for _ in range(seconds):
+        text = tmux_capture()
+        if predicate(text):
+            return text
+        time.sleep(1)
+    return None
+
+
+def login_url(text):
+    """The OAuth URL agy prints between "If not:" and the paste prompt, re-joined if it wrapped."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, l in enumerate(lines) if "If not:" in l) + 1
+    except StopIteration:
+        return None
+    parts = []
+    for line in lines[start:]:
+        if "paste the authorization code" in line or (parts and not line.strip()):
+            break
+        if line.strip():  # agy 1.2.14 puts a blank line between "If not:" and the URL
+            parts.append(line.strip())
+    url = "".join(parts)
+    return url if url.startswith("https://accounts.google.com/") else None
+
+
+def restore_previous(prev):
+    if prev and kc_read(STORE_SVC, prev):
+        kc_write(LIVE_SVC, LIVE_ACCT, kc_read(STORE_SVC, prev))
+    else:
+        kc_delete(LIVE_SVC, LIVE_ACCT)
+    m = load_meta()
+    m["active"] = prev
+    save_meta(m)
+
+
+def end_login(state, error=None):
+    if error:  # keep the last agy screen for diagnosis (no secrets: the menu / OAuth URL only)
+        try:
+            path = os.path.join(HOME, "login-last-screen.txt")
+            with open(path, "w") as f:
+                f.write(tmux_capture())
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    tmux_stop()
+    close_login_tabs()
+    restore_previous(state.get("prev"))
+    if state.get("app"):
+        subprocess.run(["open", "-a", APP])
+    try:
+        os.unlink(login_state_path())
+    except FileNotFoundError:
+        pass
+    if error:
+        sys.exit(f"ERROR: {error}; restored {state.get('prev')}")
+
+
+def cmd_login_start(a):
+    m = load_meta()
+    if not LABEL_RE.match(a.label) or a.label in m["profiles"]:
+        sys.exit("ERROR: label must look like GEMINI_D and not be enrolled yet")
+    if os.path.exists(login_state_path()):
+        sys.exit("ERROR: another sign-in is already in progress; finish or cancel it first")
+    prev, lid = live_label(m)
+    if lid and not prev:
+        sys.exit("ERROR: live account is not enrolled; enroll it first so it is not lost")
+    was_app, left = close_all()
+    if left:
+        sys.exit(f"ERROR: could not stop {left} within {DRAIN_SECONDS}s; nothing changed")
+    state = {"label": a.label, "prev": prev, "app": was_app, "started": time.time()}
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(login_state_path(), "w") as f:
+        json.dump(state, f)
+    if prev:
+        kc_write(STORE_SVC, prev, kc_read(LIVE_SVC, LIVE_ACCT))  # keep refreshed tokens
+    kc_delete(LIVE_SVC, LIVE_ACCT)
+    tmux_start()
+    menu = wait_screen(lambda t: "Google OAuth" in t or "If not:" in t)
+    if menu and "If not:" not in menu:
+        if "> 1. Google OAuth" not in menu:
+            end_login(state, "unexpected agy login menu")
+        tmux_send("Enter")
+    screen = wait_screen(lambda t: login_url(t) is not None)
+    if not screen:
+        end_login(state, "agy did not show a sign-in URL")
+    if prev:
+        # This agy is now waiting for the code. Put the previous account back meanwhile: every other agy
+        # started while no account is live (scheduled jobs) opened a Google sign-in tab of its own.
+        kc_write(LIVE_SVC, LIVE_ACCT, kc_read(STORE_SVC, prev))
+    out({"label": a.label, "url": login_url(screen)}, a.json, login_url(screen))
+
+
+def cmd_login_finish(a):
+    try:
+        with open(login_state_path()) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        sys.exit("ERROR: no sign-in in progress")
+    if not re.fullmatch(r"[A-Za-z0-9/_.-]{10,200}", a.code or ""):
+        sys.exit("ERROR: that does not look like an authorization code")
+    m = load_meta()
+    prev = state.get("prev")
+    prev_id = m["profiles"].get(prev, {}).get("id") if prev else None
+    tmux_send(a.code, literal=True)
+    tmux_send("Enter")
+    raw = None
+    for _ in range(60):  # the previous account is live meanwhile; wait for agy to write the new one
+        raw = kc_read(LIVE_SVC, LIVE_ACCT)
+        if identity(raw or "") not in (None, prev_id):
+            break
+        time.sleep(1)
+    lid = identity(raw or "")
+    if not lid or lid == prev_id:
+        end_login(state, "sign-in did not complete (code wrong or expired?)"
+                  + (f", or that Google account is already enrolled as {prev}" if prev else ""))
+    owner = next((label for label, p in m["profiles"].items() if p["id"] == lid), None)
+    if owner:
+        end_login(state, f"that Google account is already enrolled as {owner}")
+    # Leave agy at its folder-trust prompt: choose "No, exit" (never Enter on "Yes").
+    trust = wait_screen(lambda t: "No, exit" in t, seconds=20)
+    if trust and "> No, exit" not in trust:
+        tmux_send("Down")
+        trust = wait_screen(lambda t: "> No, exit" in t, seconds=5)
+    if trust:
+        tmux_send("Enter")
+    kc_write(STORE_SVC, state["label"], raw)
+    if identity(kc_read(STORE_SVC, state["label"]) or "") != lid:
+        end_login(state, "stored copy failed verification")
+    m["profiles"][state["label"]] = {"id": lid, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    save_meta(m)
+    end_login(state)
+    out({"enrolled": state["label"], "id": lid, "restored": state.get("prev")}, a.json,
+        f"enrolled: {state['label']} (id {lid}); restored {state.get('prev')}")
+
+
+def cmd_login_cancel(a):
+    try:
+        with open(login_state_path()) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        out({"restored": None}, a.json, "no sign-in in progress")
+        return
+    end_login(state)
+    out({"restored": state.get("prev")}, a.json, f"cancelled; restored {state.get('prev')}")
+
+
+def cmd_remove(a):
+    """Forget an enrolled account: delete its stored copy and metadata (the Google account is untouched)."""
+    m = load_meta()
+    if a.label not in m["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    live, _ = live_label(m)
+    if live == a.label:
+        sys.exit(f"ERROR: {a.label} is the live account; switch to another one first")
+    kc_delete(STORE_SVC, a.label)
+    del m["profiles"][a.label]
+    save_meta(m)
+    out({"removed": a.label}, a.json, f"removed: {a.label}")
+
+
+def cmd_current(a):
+    m = load_meta()
+    label, lid = live_label(m)
+    out({"active": label, "live_id": lid}, a.json, label or f"UNKNOWN (live id {lid})")
+
+
+def cmd_list(a):
+    m = load_meta()
+    cur, _ = live_label(m)
+    rows = {}
+    for label, p in sorted(m["profiles"].items()):
+        ok = identity(kc_read(STORE_SVC, label) or "") == p["id"]
+        rows[label] = {"enrolled": True, "ready": ok, "active": label == cur}
+    if a.json:
+        print(json.dumps({"active": cur, "profiles": rows}))
+    else:
+        for label, r in rows.items():
+            print(f'{"*" if r["active"] else " "} {label:10} {"READY" if r["ready"] else "BROKEN"}')
+
+
+def smoke(timeout):
+    t0 = time.time()
+    with tempfile.TemporaryDirectory() as wd:
+        try:
+            r = subprocess.run(["agy", "-p", "Return exactly: AGY_ACCOUNT_SMOKE_OK",
+                                "--print-timeout", f"{timeout}s"],
+                               cwd=wd, capture_output=True, text=True, timeout=timeout + 30,
+                               stdin=subprocess.DEVNULL)
+            code, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            code, text = 124, "timeout"
+    ok = "AGY_ACCOUNT_SMOKE_OK" in text
+    if ok:
+        status = "PASS"
+    elif any(k in text for k in QUOTA_MARKERS):
+        status = "PROFILE_ACTIVATED_BUT_ACCOUNT_UNAVAILABLE"
+    else:
+        status = "FAIL"
+    return {"status": status, "exit": code, "elapsed_s": round(time.time() - t0, 1),
+            "detail": None if ok else text.strip()[-300:]}
+
+
+def cmd_probe(a):
+    m = load_meta()
+    if a.label:
+        label, _ = live_label(m)
+        if label != a.label:
+            sys.exit(f"ERROR: live profile is {label}, not {a.label}; run `use {a.label}` first")
+    label, lid_before = live_label(m)
+    res = smoke(a.timeout)
+    label_after, lid_after = live_label(m)
+    res.update({"profile": label, "live_id": lid_before, "id_stable": lid_before == lid_after})
+    out(res, a.json, f'{label}: {res["status"]} exit={res["exit"]} {res["elapsed_s"]}s'
+        + (f' detail={res["detail"]!r}' if res["detail"] else ""))
+    sys.exit(0 if res["status"] == "PASS" else 3)
+
+
+def agy_cli_running():
+    r = subprocess.run(["pgrep", "-x", "agy"], capture_output=True, text=True)
+    return sorted(int(p) for p in r.stdout.split())
+
+
+def cmd_warm(a):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: BUSY another account switch is in progress")
+        _cmd_warm_locked(a)
+
+
+def _cmd_warm_locked(a):
+    """Start an idle account's quota clock: make it live for one tiny `agy -p`, then restore (live: in place).
+    Antigravity.app may stay open (it only reads the item at startup); a running agy CLI may not."""
+    m = load_meta()
+    if a.label not in m["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    target = kc_read(STORE_SVC, a.label)
+    tid = identity(target or "")
+    if tid != m["profiles"][a.label]["id"]:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed")
+    pids = agy_cli_running()
+    if pids:
+        sys.exit(f"ERROR: BUSY agy is running (pids {pids}); warm up later")
+    snapshot = kc_read(LIVE_SVC, LIVE_ACCT)
+    prev, snapshot_id = live_label(m)
+    if prev == a.label:
+        # Live but idle: its clock is not running either; one prompt as it is, nothing to swap or restore.
+        res = smoke(a.timeout)
+        res.update({"warmed": a.label, "restored": prev, "restore_ok": True})
+        out(res, a.json, f'{a.label}: warm-up {res["status"]} (live, in place)')
+        if res["status"] != "PASS":
+            sys.exit(3)
+        return
+    if snapshot_id and not prev:
+        sys.exit("ERROR: live account is not enrolled; enroll it first so it is not lost")
+    kc_write(LIVE_SVC, LIVE_ACCT, target)
+    try:
+        if identity(kc_read(LIVE_SVC, LIVE_ACCT) or "") != tid:
+            raise RuntimeError("read-back verification failed")
+        res = smoke(a.timeout)
+    finally:
+        after = kc_read(LIVE_SVC, LIVE_ACCT)
+        if after and identity(after) == tid:
+            if after != target:
+                kc_write(STORE_SVC, a.label, after)  # keep refreshed tokens
+            if snapshot:
+                kc_write(LIVE_SVC, LIVE_ACCT, snapshot)
+            else:
+                kc_delete(LIVE_SVC, LIVE_ACCT)
+        # else: something (the app) already wrote its own account back; leave it
+    restored, _ = live_label(m)
+    res.update({"warmed": a.label, "restored": restored, "restore_ok": restored == prev})
+    out(res, a.json, f'{a.label}: warm-up {res["status"]}; live back to {restored}')
+    if res["status"] != "PASS" or restored != prev:
+        sys.exit(3)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="agy-account")
+    p.add_argument("--json", action="store_true")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("list"); sp.add_parser("status"); sp.add_parser("current")
+    e = sp.add_parser("enroll"); e.add_argument("label")
+    sp.add_parser("logout-live")
+    u = sp.add_parser("use"); u.add_argument("label"); u.add_argument("--force", action="store_true")
+    u.add_argument("--close-all", action="store_true",
+                   help="quit Antigravity.app + stop agy first, reopen the app after switching")
+    ls_ = sp.add_parser("login-start", help="phone sign-in: park live, start agy, print the Google URL")
+    ls_.add_argument("label")
+    lf = sp.add_parser("login-finish", help="paste the authorization code, enroll, restore previous")
+    lf.add_argument("--code", required=True)
+    sp.add_parser("login-cancel", help="abort the phone sign-in and restore the previous account")
+    rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    pr = sp.add_parser("probe"); pr.add_argument("label", nargs="?")
+    pr.add_argument("--timeout", type=int, default=90)
+    w = sp.add_parser("warm", help="start an idle account's quota clock with one tiny prompt, then restore")
+    w.add_argument("label"); w.add_argument("--timeout", type=int, default=60)
+    a = p.parse_args()
+    {"list": cmd_list, "status": cmd_list, "current": cmd_current, "enroll": cmd_enroll,
+     "logout-live": cmd_logout_live, "use": cmd_use, "probe": cmd_probe, "login-start": cmd_login_start,
+     "login-finish": cmd_login_finish, "login-cancel": cmd_login_cancel, "remove": cmd_remove, "warm": cmd_warm}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

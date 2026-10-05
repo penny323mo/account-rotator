@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Daemon tests
+        run: python3 -m unittest discover -s tests
+      - name: Helper tests
+        run: cd helpers && python3 -m unittest discover -p 'test_*.py'
+      - name: Build the app
+        run: scripts/build.sh
+      - name: No secrets (gitleaks, whole history)
+        run: brew install gitleaks && gitleaks git . --no-banner --redact
+      - name: No personal data
+        run: scripts/check-personal.sh

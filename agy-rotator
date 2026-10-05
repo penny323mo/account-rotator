@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'daemon'))
+from quota import QuotaError
+from service import rpc, serve
+
+def main():
+    p = argparse.ArgumentParser(description='AGY Rotator — quota monitor and automatic rotation')
+    p.add_argument('--home', type=Path, default=Path.home() / '.agy-rotator')
+    p.add_argument('--json', action='store_true', help='JSON is always emitted')
+    sub = p.add_subparsers(dest='command', required=True)
+    for name in ('daemon', 'status', 'list', 'current', 'quota', 'refresh', 'on', 'off', 'cancel'):
+        sub.add_parser(name)
+    use = sub.add_parser('use')
+    use.add_argument('label')
+    how = use.add_mutually_exclusive_group()
+    how.add_argument('--now', action='store_true', help='Explicitly close app/agy; interrupts running sessions')
+    how.add_argument('--wait-idle', action='store_true', help='Queue; switch once agy/app are idle, never forced')
+    config = sub.add_parser('config')
+    config.add_argument('action', choices=['get', 'set'])
+    config.add_argument('--file', type=Path, help='JSON config document')
+    config.add_argument('--revision', type=int)
+    a = p.parse_args()
+    if a.command == 'daemon':
+        serve(a.home)
+        return
+    params = {}
+    method = a.command
+    if method in ('on', 'off'):
+        params = {'enabled': method == 'on'}
+        method = 'enabled.set'
+    elif method == 'use':
+        params = {'label': a.label, 'now': a.now, 'wait_idle': a.wait_idle}
+    elif method == 'config':
+        method = 'config.' + a.action
+        if a.action == 'set':
+            if a.file is None or a.revision is None:
+                p.error('config set requires --file and --revision (from config get)')
+            params = {'config': json.loads(a.file.read_text()), 'revision': a.revision}
+    print(json.dumps(rpc(a.home, method, params), indent=2))
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (QuotaError, OSError, ValueError) as e:
+        print(json.dumps({'error': str(e) if isinstance(e, QuotaError) else 'SERVICE_OR_INPUT_UNAVAILABLE'}))
+        sys.exit(1)

@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""claude-account — enroll Claude Code (claude.ai subscription) accounts, read their usage, warm idle ones.
+
+Mechanism (verified against Claude Code 2.1.289, macOS):
+  The live login is the Keychain item "Claude Code-credentials" (account = $USER); its JSON holds
+  `claudeAiOauth` (access/refresh token, expiry, scopes, plan) next to `mcpOAuth` (MCP server logins, which
+  this tool never touches). The matching profile (email, account/org uuid) is `oauthAccount` in ~/.claude.json.
+  Running Claude Code sessions re-read the Keychain item about every 30 s.
+
+  Refresh tokens rotate on every refresh (Claude Code writes them back with compare-and-swap), so every
+  account has exactly one live copy: the enrolled copy in the Keychain (service "claude-account-broker",
+  account <LABEL>) while idle, or the live item while active. This tool never refreshes the live account
+  (Claude Code does that); it refreshes an idle account's token only when it needs one, and stores the new
+  pair back at once.
+
+  Usage: GET https://api.anthropic.com/api/oauth/usage -> five_hour / seven_day utilization (% used).
+  Warm-up: one tiny `claude -p` with CLAUDE_CODE_OAUTH_TOKEN in a throwaway CLAUDE_CONFIG_DIR, so the live
+  login, settings, hooks and plugins are untouched.
+
+  Secrets move only through `security -i` stdin and environment variables of child processes; never argv,
+  stdout or logs. Metadata stores labels + hashed ids only.
+"""
+import argparse, base64, fcntl, getpass, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, unicodedata, zlib
+import urllib.error, urllib.request
+
+STORE_SVC = "claude-account-broker"
+LIVE_SVC = "Claude Code-credentials"
+HOME = os.path.expanduser(os.environ.get("CLAUDE_ACCOUNT_HOME", "~/.claude-account"))
+META = os.path.join(HOME, "profiles.json")
+CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_ACCOUNT_CLAUDE_JSON", "~/.claude.json"))
+SEC = "/usr/bin/security"
+CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+API = "https://api.anthropic.com"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+BETA = "oauth-2025-04-20"
+LABEL_RE = re.compile(r"^CLAUDE_[A-Z0-9_]{1,20}$")
+MAX_VALUE = 3900  # `security -i` splits longer command lines
+REFRESH_MARGIN = 300  # seconds: refresh an idle token that expires sooner than this
+LOGIN_TMUX = "claude-account-login"
+URL_RE = re.compile(r"https://claude\.com/cai/oauth/authorize\?\S+")
+CODE_RE = re.compile(r"[A-Za-z0-9_\-#.]{10,400}")
+QUOTA_MARKERS = ("usage limit", "rate limit", "Rate limit", "429", "limit reached", "Claude AI usage limit")
+
+
+class UsageError(Exception):
+    """Constant, non-sensitive error codes only."""
+
+
+# ---------- keychain (secret values never leave these functions except as return values) ----------
+def kc_read(svc, acct):
+    r = subprocess.run([SEC, "find-generic-password", "-s", svc, "-a", acct, "-w"], capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_write(label, value):
+    if any(c in value for c in " \"'\\\n") or len(value) >= MAX_VALUE:
+        raise ValueError("refusing to store an unexpected credential blob")
+    r = subprocess.run([SEC, "-i"], input=f"add-generic-password -U -s {STORE_SVC} -a {label} -w {value}\n",
+                       capture_output=True, text=True)
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        raise RuntimeError(f"keychain write failed for {STORE_SVC}/{label}")
+
+
+def kc_delete(label):
+    subprocess.run([SEC, "delete-generic-password", "-s", STORE_SVC, "-a", label], capture_output=True, text=True)
+
+
+def encode(data):
+    return base64.urlsafe_b64encode(zlib.compress(json.dumps(data, separators=(",", ":")).encode())).decode()
+
+
+def decode(value):
+    try:
+        return json.loads(zlib.decompress(base64.urlsafe_b64decode(value.encode())))
+    except Exception:
+        return None
+
+
+def write_live_item(full):
+    """Replace the live Keychain item the way Claude Code does: hex payload, `security -i` when it fits,
+    argv otherwise (Claude Code itself falls back to argv for items longer than the stdin line limit)."""
+    hexed = json.dumps(full, separators=(",", ":")).encode().hex()
+    cmd = f'add-generic-password -U -a "{live_user()}" -s "{LIVE_SVC}" -X "{hexed}" '
+    if len(cmd) <= 4000:
+        r = subprocess.run([SEC, "-i"], input=cmd + "\n", capture_output=True, text=True)
+    else:
+        r = subprocess.run([SEC, "add-generic-password", "-U", "-a", live_user(), "-s", LIVE_SVC, "-X", hexed],
+                           capture_output=True, text=True)
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        raise RuntimeError("live keychain write failed")
+
+
+def read_live_item():
+    raw = kc_read(LIVE_SVC, live_user())
+    return json.loads(raw) if raw else None
+
+
+def write_claude_json_account(account):
+    """Swap oauthAccount in ~/.claude.json, keeping every other setting (atomic replace, same mode)."""
+    with open(CLAUDE_JSON) as f:
+        cfg = json.load(f)
+    cfg["oauthAccount"] = account
+    mode = os.stat(CLAUDE_JSON).st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CLAUDE_JSON), prefix=".claude.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, CLAUDE_JSON)
+
+
+def live_user():
+    return os.environ.get("USER") or getpass.getuser()
+
+
+def read_live():
+    """{"oauth": claudeAiOauth, "account": oauthAccount} of the live login, or None."""
+    try:
+        oauth = json.loads(kc_read(LIVE_SVC, live_user()) or "{}").get("claudeAiOauth")
+        with open(CLAUDE_JSON) as f:
+            account = json.load(f).get("oauthAccount")
+    except (OSError, ValueError):
+        return None
+    return {"oauth": oauth, "account": account} if oauth and account else None
+
+
+def identity(data):
+    """Opaque, stable id = sha256(account uuid|organization uuid), truncated. None if unusable."""
+    acc = (data or {}).get("account") or {}
+    if not acc.get("accountUuid") or not ((data or {}).get("oauth") or {}).get("refreshToken"):
+        return None
+    return hashlib.sha256(f'{acc["accountUuid"]}|{acc.get("organizationUuid")}'.encode()).hexdigest()[:12]
+
+
+# ---------- metadata (labels + opaque ids only, no secrets) ----------
+def load_meta():
+    try:
+        with open(META) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"profiles": {}}
+
+
+def save_meta(meta):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=HOME)
+    with os.fdopen(fd, "w") as f:
+        json.dump(meta, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, META)
+
+
+def label_for(meta, ident):
+    return next((label for label, p in meta["profiles"].items() if ident and p["id"] == ident), None)
+
+
+def out(obj, as_json, text):
+    print(json.dumps(obj) if as_json else text)
+
+
+# ---------- API ----------
+def api_get(path, access):
+    req = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + access, "anthropic-beta": BETA,
+                                                      "Content-Type": "application/json", "User-Agent": "claude-account"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise UsageError("TOKEN_EXPIRED" if e.code == 401 else "TOKEN_REJECTED" if e.code == 403
+                         else f"HTTP_{e.code}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise UsageError("NETWORK_ERROR") from None
+
+
+def refresh(oauth):
+    """New token pair for an idle account (the old refresh token is spent by this call)."""
+    body = {"grant_type": "refresh_token", "refresh_token": oauth["refreshToken"],
+            "client_id": oauth.get("clientId") or CLIENT_ID, "scope": " ".join(oauth.get("scopes") or [])}
+    req = urllib.request.Request(TOKEN_URL, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "User-Agent": "claude-account"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise UsageError("RELOGIN_REQUIRED" if e.code in (400, 401, 403) else f"REFRESH_HTTP_{e.code}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise UsageError("NETWORK_ERROR") from None
+    if not d.get("access_token") or not isinstance(d.get("expires_in"), (int, float)):
+        raise UsageError("INVALID_TOKEN_RESPONSE")
+    new = dict(oauth, accessToken=d["access_token"], refreshToken=d.get("refresh_token") or oauth["refreshToken"],
+               expiresAt=int((time.time() + d["expires_in"]) * 1000))
+    if d.get("scope"):
+        new["scopes"] = d["scope"].split()
+    return new
+
+
+def stored(meta, label):
+    data = decode(kc_read(STORE_SVC, label) or "")
+    if identity(data) != meta["profiles"].get(label, {}).get("id"):
+        raise UsageError("PROFILE_BROKEN")
+    return data
+
+
+def idle_access(meta, label):
+    """A usable access token for an idle account, refreshing (and saving the new pair) when needed."""
+    data = stored(meta, label)
+    if data["oauth"].get("expiresAt", 0) / 1000 - time.time() < REFRESH_MARGIN:
+        data["oauth"] = refresh(data["oauth"])
+        kc_write(label, encode(data))
+    return data["oauth"]["accessToken"]
+
+
+def usage_row(payload):
+    row = {"status": "OK"}
+    for key, name in (("five_hour", "5h"), ("seven_day", "weekly")):
+        w = payload.get(key)
+        if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+            used = w["utilization"]
+            row[name] = {"used_percent": used, "remaining_percent": max(0.0, 100.0 - used), "reset_at": w.get("resets_at")}
+    row["limit_reached"] = any(row.get(w, {}).get("remaining_percent", 1) <= 0 for w in ("5h", "weekly"))
+    return row
+
+
+# ---------- sign in a new account from the phone (a private CLAUDE_CONFIG_DIR: the live login is untouched) ----------
+def login_state_path():
+    return os.path.join(HOME, "login.json")
+
+
+def private_service(config_dir):
+    """Keychain service Claude Code uses for a login made with CLAUDE_CONFIG_DIR=config_dir."""
+    norm = unicodedata.normalize("NFC", config_dir)
+    return f'{LIVE_SVC}-{hashlib.sha256(norm.encode()).hexdigest()[:8]}'
+
+
+def tmux_capture():
+    return subprocess.run(["tmux", "capture-pane", "-p", "-J", "-t", LOGIN_TMUX], capture_output=True, text=True).stdout
+
+
+def tmux_send(keys, literal=False):
+    subprocess.run(["tmux", "send-keys", "-t", LOGIN_TMUX] + (["-l"] if literal else []) + [keys], capture_output=True)
+
+
+def no_browser_path():
+    """A PATH entry whose `open` does nothing, plus BROWSER=true: the sign-in link goes to the phone only."""
+    d = os.path.join(HOME, "no-browser")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    shim = os.path.join(d, "open")
+    if not os.access(shim, os.X_OK):
+        with open(shim, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(shim, 0o700)
+    return d
+
+
+def tmux_start(config_dir):
+    subprocess.run(["tmux", "kill-session", "-t", LOGIN_TMUX], capture_output=True)
+    env = ["env", "-u", "ANTHROPIC_API_KEY", "-u", "CLAUDE_CODE_OAUTH_TOKEN",
+           f"PATH={no_browser_path()}:{os.environ.get('PATH', '/usr/bin:/bin')}", "BROWSER=true",
+           f"CLAUDE_CONFIG_DIR={config_dir}", CLAUDE, "auth", "login", "--claudeai"]
+    subprocess.run(["tmux", "new-session", "-d", "-s", LOGIN_TMUX, "-x", "500", "-y", "50", "-c", config_dir, *env],
+                   capture_output=True)
+
+
+def private_services():
+    out = subprocess.run([SEC, "dump-keychain"], capture_output=True, text=True).stdout
+    return set(re.findall(r'"svce"<blob>="(' + re.escape(LIVE_SVC) + r'-[0-9a-f]{8})"', out))
+
+
+def read_private(config_dir, known=()):
+    """The login Claude Code stored for config_dir: by its derived name, else the one that appeared since start."""
+    svc = private_service(config_dir)
+    if kc_read(svc, live_user()) is None:
+        new = sorted(private_services() - set(known))
+        svc = new[0] if len(new) == 1 else svc
+    try:
+        oauth = json.loads(kc_read(svc, live_user()) or "{}").get("claudeAiOauth")
+        with open(os.path.join(config_dir, ".claude.json")) as f:
+            account = json.load(f).get("oauthAccount")
+    except (OSError, ValueError):
+        return None
+    return {"oauth": oauth, "account": account, "_service": svc} if oauth and account else None
+
+
+def end_login(state, error=None):
+    subprocess.run(["tmux", "kill-session", "-t", LOGIN_TMUX], capture_output=True)
+    if state.get("config_dir"):
+        for svc in {private_service(state["config_dir"]), state.get("service")} - {None}:
+            subprocess.run([SEC, "delete-generic-password", "-s", svc, "-a", live_user()], capture_output=True)
+        shutil.rmtree(state["config_dir"], ignore_errors=True)
+    try:
+        os.unlink(login_state_path())
+    except FileNotFoundError:
+        pass
+    if error:
+        sys.exit(f"ERROR: {error}")
+
+
+def cmd_login_start(a):
+    meta = load_meta()
+    if not LABEL_RE.match(a.label) or a.label in meta["profiles"]:
+        sys.exit("ERROR: label must look like CLAUDE_B and not be enrolled yet")
+    if os.path.exists(login_state_path()):
+        sys.exit("ERROR: another sign-in is already in progress; finish or cancel it first")
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    config_dir = os.path.realpath(tempfile.mkdtemp(prefix="login-", dir=HOME))
+    state = {"label": a.label, "config_dir": config_dir, "started": time.time(), "known": sorted(private_services())}
+    with open(login_state_path(), "w") as f:
+        json.dump(state, f)
+    tmux_start(config_dir)
+    url = None
+    for _ in range(40):
+        found = URL_RE.search(tmux_capture())
+        if found:
+            url = found.group(0)
+            break
+        time.sleep(1)
+    if not url:
+        end_login(state, "claude did not show a sign-in URL")
+    out({"label": a.label, "url": url}, a.json, url)
+
+
+def cmd_login_finish(a):
+    try:
+        with open(login_state_path()) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        sys.exit("ERROR: no sign-in in progress")
+    if not CODE_RE.fullmatch(a.code or ""):
+        sys.exit("ERROR: that does not look like an authorization code")
+    tmux_send(a.code, literal=True)
+    tmux_send("Enter")
+    data = None
+    for _ in range(60):
+        data = read_private(state["config_dir"], state.get("known", ()))
+        if identity(data):
+            state["service"] = data.pop("_service")
+            break
+        time.sleep(1)
+    lid = identity(data)
+    if not lid:
+        end_login(state, "sign-in did not complete (code wrong or expired?)")
+    meta = load_meta()
+    owner = label_for(meta, lid)
+    if owner:
+        end_login(state, f"that Claude account is already enrolled as {owner}")
+    kc_write(state["label"], encode(data))
+    if identity(decode(kc_read(STORE_SVC, state["label"]) or "")) != lid:
+        end_login(state, "stored copy failed verification")
+    meta["profiles"][state["label"]] = {"id": lid, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    save_meta(meta)
+    end_login(state)
+    out({"enrolled": state["label"], "id": lid, "email": data["account"].get("emailAddress")}, a.json,
+        f'enrolled {state["label"]} ({data["account"].get("emailAddress")})')
+
+
+def cmd_login_cancel(a):
+    try:
+        with open(login_state_path()) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        out({"cancelled": False}, a.json, "no sign-in in progress")
+        return
+    end_login(state)
+    out({"cancelled": True}, a.json, "cancelled")
+
+
+# ---------- commands ----------
+def cmd_enroll(a):
+    if not LABEL_RE.match(a.label):
+        sys.exit("ERROR: label must look like CLAUDE_A")
+    meta = load_meta()
+    data = read_live()
+    lid = identity(data)
+    if not lid:
+        sys.exit("ERROR: no usable live Claude Code login")
+    profile = api_get("/api/oauth/profile", data["oauth"]["accessToken"])
+    if (profile.get("account") or {}).get("uuid") != data["account"]["accountUuid"]:
+        sys.exit("ERROR: live token and ~/.claude.json belong to different accounts; sign in again first")
+    owner = label_for(meta, lid)
+    if owner and owner != a.label:
+        sys.exit(f"ERROR: that account is already enrolled as {owner}")
+    if a.label in meta["profiles"] and meta["profiles"][a.label]["id"] != lid:
+        sys.exit(f"ERROR: {a.label} is another account")
+    kc_write(a.label, encode(data))
+    if identity(decode(kc_read(STORE_SVC, a.label) or "")) != lid:
+        sys.exit("ERROR: stored copy failed verification")
+    meta["profiles"][a.label] = {"id": lid, "enrolled_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    save_meta(meta)
+    out({"enrolled": a.label, "id": lid, "email": data["account"].get("emailAddress")}, a.json,
+        f'enrolled {a.label} ({data["account"].get("emailAddress")})')
+
+
+def cmd_use(a):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: another account switch is in progress")
+        _cmd_use_locked(a)
+
+
+def _cmd_use_locked(a):
+    """Make an enrolled account the live Claude Code login. Running sessions follow within ~30 s (they re-read the
+    Keychain); nothing is closed. The live login is saved back into its own profile first (tokens rotate)."""
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    try:
+        target = stored(meta, a.label)
+    except UsageError:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed; live state untouched")
+    full = read_live_item()
+    live = read_live()
+    prev = label_for(meta, identity(live))
+    if prev == a.label:
+        out({"selected": a.label, "previous": prev, "activation": "UNCHANGED"}, a.json, f"{a.label} is already live")
+        return
+    if identity(live) and not prev:
+        sys.exit("ERROR: live account is not enrolled; enroll it first so it is not lost")
+    if prev:
+        kc_write(prev, encode(live))  # keep the tokens Claude Code rotated
+        if identity(decode(kc_read(STORE_SVC, prev) or "")) != meta["profiles"][prev]["id"]:
+            sys.exit(f"ERROR: could not save {prev} back; live state untouched")
+    old_account = live["account"] if live else None
+    try:
+        write_live_item({**(full or {}), "claudeAiOauth": target["oauth"]})  # MCP logins etc. kept as they are
+        write_claude_json_account(target["account"])
+        after = read_live()
+        if identity(after) != meta["profiles"][a.label]["id"] or after["oauth"]["refreshToken"] != target["oauth"]["refreshToken"]:
+            raise RuntimeError("read-back verification failed")
+    except (RuntimeError, OSError, ValueError, KeyError) as e:
+        try:
+            if full is not None:
+                write_live_item(full)
+            if old_account is not None:
+                write_claude_json_account(old_account)
+            rolled = label_for(meta, identity(read_live())) == prev
+        except (RuntimeError, OSError, ValueError):
+            rolled = False
+        out({"selected": None, "previous": prev, "activation": "ROLLED_BACK" if rolled else "ROLLBACK_FAILED",
+             "error": str(e)}, a.json, f"ERROR: switch failed ({e}); {'rolled back to ' + str(prev) if rolled else 'CHECK CURRENT LOGIN'}")
+        sys.exit(2)
+    out({"selected": a.label, "previous": prev, "activation": "OK"}, a.json,
+        f"live: {a.label} (was {prev}); running Claude Code sessions follow within ~30 s")
+
+
+def cmd_current(a):
+    meta = load_meta()
+    label = label_for(meta, identity(read_live()))
+    out({"active": label}, a.json, label or "(live account not enrolled)")
+
+
+def cmd_list(a):
+    meta = load_meta()
+    active = label_for(meta, identity(read_live()))
+    rows = {label: {"active": label == active, "ok": identity(decode(kc_read(STORE_SVC, label) or "")) == p["id"]}
+            for label, p in sorted(meta["profiles"].items())}
+    out({"profiles": rows}, a.json,
+        "\n".join(f'{"*" if r["active"] else " "} {label:10} {"READY" if r["ok"] else "BROKEN"}' for label, r in rows.items()))
+
+
+def cmd_quota(a):
+    """Usage per profile. The live account uses the live token and is never refreshed here."""
+    meta = load_meta()
+    live = read_live()
+    active = label_for(meta, identity(live))
+    labels = [a.label] if a.label else sorted(meta["profiles"])
+    rows = {}
+    for label in labels:
+        email = plan = None
+        try:
+            if label == active:
+                access, email, plan = live["oauth"]["accessToken"], live["account"].get("emailAddress"), live["oauth"].get("subscriptionType")
+            else:
+                data = stored(meta, label)
+                email, plan = data["account"].get("emailAddress"), data["oauth"].get("subscriptionType")
+                access = idle_access(meta, label)
+            row = usage_row(api_get("/api/oauth/usage", access))
+        except UsageError as e:
+            row = {"status": str(e)}
+        rows[label] = {**row, "active": label == active, "email": email, "plan": plan}
+    if a.json:
+        print(json.dumps({"profiles": rows}))
+    else:
+        for label, r in rows.items():
+            q = lambda w: f'{r[w]["remaining_percent"]:.0f}%' if w in r else "-"
+            print(f'{"*" if r["active"] else " "} {label:10} {r["status"]:14} 5h left {q("5h"):>5}  weekly left {q("weekly"):>5}')
+
+
+def cmd_warm(a):
+    """Start an account's 5 h clock with one tiny `claude -p` in a throwaway config dir (live login untouched)."""
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    live = read_live()
+    try:
+        if label_for(meta, identity(live)) == a.label:
+            if live["oauth"].get("expiresAt", 0) / 1000 - time.time() < 60:
+                raise UsageError("LIVE_TOKEN_EXPIRED")  # Claude Code refreshes the live one, not us
+            access = live["oauth"]["accessToken"]
+        else:
+            access = idle_access(meta, a.label)
+    except UsageError as e:
+        out({"warmed": a.label, "status": "FAIL", "detail": str(e)}, a.json, f"{a.label}: warm-up FAIL {e}")
+        sys.exit(3)
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="claude-warm-") as cfg, tempfile.TemporaryDirectory(prefix="claude-warm-cwd-") as cwd:
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": cfg, "CLAUDE_CODE_OAUTH_TOKEN": access}
+        env.pop("ANTHROPIC_API_KEY", None)
+        try:
+            r = subprocess.run([CLAUDE, "-p", "Return exactly: CLAUDE_ACCOUNT_SMOKE_OK", "--model", a.model],
+                               cwd=cwd, env=env, capture_output=True, text=True, timeout=a.timeout, stdin=subprocess.DEVNULL)
+            code, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            code, text = 124, "timeout"
+    ok = "CLAUDE_ACCOUNT_SMOKE_OK" in text
+    status = "PASS" if ok else "PROFILE_ACTIVATED_BUT_ACCOUNT_UNAVAILABLE" if any(k in text for k in QUOTA_MARKERS) else "FAIL"
+    res = {"warmed": a.label, "status": status, "exit": code, "elapsed_s": round(time.time() - t0, 1),
+           "detail": None if ok else text.strip()[-300:]}
+    out(res, a.json, f'{a.label}: warm-up {status} exit={code} {res["elapsed_s"]}s')
+    if not ok:
+        sys.exit(3)
+
+
+def cmd_remove(a):
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    if label_for(meta, identity(read_live())) == a.label:
+        sys.exit(f"ERROR: {a.label} is the live account; switch away first")
+    kc_delete(a.label)
+    del meta["profiles"][a.label]
+    save_meta(meta)
+    out({"removed": a.label}, a.json, f"removed {a.label}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--json", action="store_true")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    e = sp.add_parser("enroll", help="enroll the live Claude Code login"); e.add_argument("label")
+    sp.add_parser("list"); sp.add_parser("current")
+    u = sp.add_parser("use", help="make an enrolled account the live Claude Code login (nothing is closed)")
+    u.add_argument("label")
+    q = sp.add_parser("quota"); q.add_argument("label", nargs="?")
+    w = sp.add_parser("warm", help="start an account's 5 h clock with one tiny prompt (live login untouched)")
+    w.add_argument("label"); w.add_argument("--model", default="haiku"); w.add_argument("--timeout", type=int, default=90)
+    rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    ls = sp.add_parser("login-start", help="phone sign-in: print the sign-in URL (live login untouched)")
+    ls.add_argument("label")
+    lf = sp.add_parser("login-finish", help="phone sign-in: paste the code shown after signing in")
+    lf.add_argument("--code", required=True)
+    sp.add_parser("login-cancel", help="phone sign-in: stop and clean up")
+    a = p.parse_args()
+    {"enroll": cmd_enroll, "use": cmd_use, "list": cmd_list, "current": cmd_current, "quota": cmd_quota, "warm": cmd_warm,
+     "remove": cmd_remove, "login-start": cmd_login_start, "login-finish": cmd_login_finish,
+     "login-cancel": cmd_login_cancel}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
