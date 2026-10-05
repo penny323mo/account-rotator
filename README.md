@@ -54,12 +54,15 @@ runs out, and start idle accounts' usage clocks.
 3. 如果未裝 Command Line Tools，app 會彈出提示，撳「安裝」就得；裝完再開一次 app。
    Without the Command Line Tools the app offers to install them; open the app again afterwards.
 
-App 開啟時會自動登記兩個背景服務（開機自動行），用嘅係 app 入面嘅程式：`io.account-rotator.daemon`（查用量、轉帳號）同
-`io.account-rotator.web`（控制台，只開放畀本機 `127.0.0.1:3082`）。macOS 會通知「已加入背景項目」。
+App 開啟時會將程式抄去 `~/Library/Application Support/Account Rotator/`，再登記兩個背景服務（開機自動行）：
+`io.account-rotator.daemon`（查用量、轉帳號）同 `io.account-rotator.web`（控制台，只開放畀本機 `127.0.0.1:3082`）。
+macOS 會通知「已加入背景項目」。之後搬動或者刪除 app 都唔會影響背景服務；裝新版再開一次 app，就會自動換新程式並重啟服務
+（換嘅時候控制台會有十幾秒顯示「連線中斷」）。
 
-At launch the app registers two login services that run the copy inside it: `io.account-rotator.daemon` (usage and
-switching) and `io.account-rotator.web` (the console, on `127.0.0.1:3082` only). macOS shows a "Background Items
-Added" notice.
+At launch the app copies the rotator to `~/Library/Application Support/Account Rotator/` and registers two login
+services that run that copy: `io.account-rotator.daemon` (usage and switching) and `io.account-rotator.web` (the
+console, on `127.0.0.1:3082` only). macOS shows a "Background Items Added" notice. Moving or deleting the app does not
+affect them; opening a newer version replaces the copy and restarts them (the console is offline for a few seconds).
 
 **由原始碼 · From source**
 
@@ -93,7 +96,8 @@ scripts/make-dmg.sh     # build → dist/Account-Rotator-<version>.dmg
 for L in io.account-rotator.daemon io.account-rotator.web; do
   launchctl bootout "gui/$(id -u)/$L"; rm -f ~/Library/LaunchAgents/$L.plist
 done
-rm -rf ~/Applications/"Account Rotator.app"
+rm -rf "/Applications/Account Rotator.app" ~/Applications/"Account Rotator.app" \
+       ~/Library/Application\ Support/"Account Rotator"
 ```
 
 設定同紀錄喺 `~/.agy-rotator`，已登記嘅帳號喺 `~/.agy-account`、`~/.codex-account`、`~/.claude-account` 同 Keychain（服務名

@@ -55,9 +55,27 @@ enum Services {
     static func trimLogs() {
         for name in ["daemon", "daemon-error", "web", "web-error"] {
             let path = "\(state)/\(name).log"
-            if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int, size > logLimit {
-                FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+            // Truncated in place: launchd keeps the file open (append mode), so a replaced file would stay empty.
+            if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int, size > logLimit,
+               let handle = FileHandle(forWritingAtPath: path) {
+                try? handle.truncate(atOffset: 0)
+                try? handle.close()
             }
+        }
+    }
+
+    static func portBusy() -> Bool {
+        !run("/usr/sbin/lsof", ["-nP", "-iTCP:3082", "-sTCP:LISTEN", "-t"]).out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Unload a service and wait until its process is gone (it still holds its lock / port 3082 for a moment), so
+    /// the next one does not start into a busy port and wait out launchd's 10 s restart throttle.
+    static func stop(_ label: String) {
+        guard loaded(label) else { return }
+        run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+        for _ in 0..<40 {
+            if !loaded(label) && !(label == labels[1] && portBusy()) { return }
+            usleep(250_000)
         }
     }
 
@@ -71,24 +89,31 @@ enum Services {
         // /usr/bin/python3 is only a stub until the Command Line Tools are installed.
         guard run("/usr/bin/xcode-select", ["-p"]).status == 0 else { return .needsTools }
         // Another copy (an older install) already serves the console: two rotators would fight over the accounts.
-        let listening = !run("/usr/sbin/lsof", ["-nP", "-iTCP:3082", "-sTCP:LISTEN", "-t"]).out
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if listening && !loaded("io.account-rotator.web") { return .otherCopyRunning }
+        if portBusy() && !loaded(labels[1]) { return .otherCopyRunning }
         try? fm.createDirectory(atPath: state, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         trimLogs()
-        let build = stamp(bundled) ?? (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0")
+        var build = stamp(bundled) ?? (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0")
         let root = support + "/rotator"
+        var problem: String?
         if stamp(root) != build || !fm.fileExists(atPath: root + "/agy-rotator") {
-            // Stop the services before their files change, then swap in this build's copy.
-            for label in labels where loaded(label) { run("/bin/launchctl", ["bootout", "\(domain)/\(label)"]) }
+            // Copy this build next to the installed one first; only then stop the services and swap it in.
             let incoming = support + "/rotator.incoming"
             try? fm.createDirectory(atPath: support, withIntermediateDirectories: true)
             try? fm.removeItem(atPath: incoming)
-            do {
-                try fm.copyItem(atPath: bundled, toPath: incoming)
+            if (try? fm.copyItem(atPath: bundled, toPath: incoming)) != nil {
+                labels.forEach(stop)
                 try? fm.removeItem(atPath: root)
-                try fm.moveItem(atPath: incoming, toPath: root)
-            } catch { return .failed("copy") }
+                if (try? fm.moveItem(atPath: incoming, toPath: root)) == nil { problem = "未能安裝新版本嘅程式。" }
+            } else {
+                problem = "未能抄新版本嘅程式去「Application Support」。"
+            }
+            if problem != nil {
+                // Keep running the version already installed, if there is one.
+                guard let installed = stamp(root), fm.fileExists(atPath: root + "/agy-rotator") else {
+                    return .failed((problem ?? "") + "背景服務未能啟動。")
+                }
+                build = installed
+            }
         }
         let agents = home + "/Library/LaunchAgents"
         try? fm.createDirectory(atPath: agents, withIntermediateDirectories: true)
@@ -100,17 +125,18 @@ enum Services {
             let label = doc["Label"] as! String
             let path = "\(agents)/\(label).plist"
             guard let data = try? PropertyListSerialization.data(fromPropertyList: doc, format: .xml, options: 0) else {
-                return .failed(label)
+                return .failed("未能建立背景服務 \(label) 嘅設定。")
             }
             let same = (try? Data(contentsOf: URL(fileURLWithPath: path))) == data
             if same && loaded(label) { continue }
             do {
                 try data.write(to: URL(fileURLWithPath: path), options: .atomic)
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
-            } catch { return .failed(label) }
-            if loaded(label) { run("/bin/launchctl", ["bootout", "\(domain)/\(label)"]) }
-            if run("/bin/launchctl", ["bootstrap", domain, path]).status != 0 { return .failed(label) }
+            } catch { return .failed("未能寫入背景服務 \(label) 嘅設定。") }
+            stop(label)
+            if run("/bin/launchctl", ["bootstrap", domain, path]).status != 0 { return .failed("未能啟動背景服務 \(label)。") }
         }
+        if let problem { return .failed(problem + "暫時繼續用緊舊版本。") }
         return .ready
     }
 
@@ -146,10 +172,10 @@ enum Services {
             alert.informativeText = "本機 127.0.0.1:3082 已經俾另一個版本用緊。兩個同時運行會爭住轉帳號，所以呢個版本冇啟動背景服務。請先停咗舊嗰個，再開一次。"
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
-        case .failed(let label):
+        case .failed(let message):
             let alert = NSAlert()
-            alert.messageText = "未能啟動背景服務"
-            alert.informativeText = "登記 \(label) 失敗。請再開一次 Account Rotator；如果仍然失敗，睇 ~/.agy-rotator 入面嘅 log。"
+            alert.messageText = "背景服務出咗問題"
+            alert.informativeText = message + "請結束再打開一次 Account Rotator；如果仍然失敗，睇 ~/.agy-rotator 入面嘅 log。"
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
         }

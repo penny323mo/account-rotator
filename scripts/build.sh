@@ -5,6 +5,7 @@ cd "$ROOT/app"
 # One app for Apple silicon and Intel Macs: build each architecture, then join them (works without full Xcode).
 for ARCH in arm64 x86_64; do swift build -c release --triple "$ARCH-apple-macosx13.0"; done
 BIN=$(mktemp -d)
+trap 'rm -rf "$BIN"' EXIT
 lipo -create -output "$BIN/AGYRotator" \
   "$(swift build -c release --triple arm64-apple-macosx13.0 --show-bin-path)/AGYRotator" \
   "$(swift build -c release --triple x86_64-apple-macosx13.0 --show-bin-path)/AGYRotator"
@@ -29,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>AGYRotator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.1</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleShortVersionString</key><string>0.1.2</string>
+<key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

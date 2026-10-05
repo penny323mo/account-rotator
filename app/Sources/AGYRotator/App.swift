@@ -207,13 +207,6 @@ enum API {
     }
 }
 
-extension ISO8601DateFormatter {
-    static let withFraction: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-}
 
 /// A transparent web view so the window's own background shows through. `drawsBackground` is not public API: set it
 /// only while WKWebView still answers to it, so a future macOS that drops it gets an opaque view instead of a crash.
