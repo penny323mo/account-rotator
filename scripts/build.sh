@@ -8,6 +8,11 @@ APP="$ROOT/dist/Account Rotator.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/app/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$BIN/AGYRotator" "$APP/Contents/MacOS/AGYRotator"
+# The rotator itself (daemon, helpers, console) travels inside the app; the app registers it as login services.
+PAYLOAD="$APP/Contents/Resources/rotator"
+rm -rf "$PAYLOAD" && mkdir -p "$PAYLOAD"
+rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude 'test_*.py' \
+  "$ROOT/agy-rotator" "$ROOT/daemon" "$ROOT/helpers" "$ROOT/web" "$PAYLOAD/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

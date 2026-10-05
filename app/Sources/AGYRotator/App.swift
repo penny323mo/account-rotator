@@ -468,6 +468,11 @@ struct ConsoleWindow: View {
                 Darwin.exit(1)
             }
         }
+        if CommandLine.arguments.contains("--ensure-services") {
+            print("services: \(Services.ensure())")
+            Darwin.exit(0)
+        }
+        Task { @MainActor in Services.start() }
     }
     var body: some Scene {
         Window("Account Rotator", id: "dashboard") {

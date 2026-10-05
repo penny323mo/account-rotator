@@ -44,17 +44,31 @@ runs out, and start idle accounts' usage clocks.
 
 ## 安裝 · Install
 
+**用 .dmg（建議）· From the .dmg (recommended)**
+
+1. 打開 `Account-Rotator-<版本>.dmg`，將 **Account Rotator** 拖去 **Applications**。
+   Open the .dmg and drag **Account Rotator** onto **Applications**.
+2. 第一次開：app 冇 Apple 公證，macOS 會話「無法驗證開發者」。去 **系統設定 → 私隱與安全性**，喺下面撳 **仍要打開**。
+   The app is not notarized, so macOS blocks the first launch: go to **System Settings → Privacy & Security** and
+   click **Open Anyway**.
+3. 如果未裝 Command Line Tools，app 會彈出提示，撳「安裝」就得；裝完再開一次 app。
+   Without the Command Line Tools the app offers to install them; open the app again afterwards.
+
+App 開啟時會自動登記兩個背景服務（開機自動行），用嘅係 app 入面嘅程式：`io.account-rotator.daemon`（查用量、轉帳號）同
+`io.account-rotator.web`（控制台，只開放畀本機 `127.0.0.1:3082`）。macOS 會通知「已加入背景項目」。
+
+At launch the app registers two login services that run the copy inside it: `io.account-rotator.daemon` (usage and
+switching) and `io.account-rotator.web` (the console, on `127.0.0.1:3082` only). macOS shows a "Background Items
+Added" notice.
+
+**由原始碼 · From source**
+
 ```zsh
-git clone <this repository> ~/account-rotator
+git clone https://github.com/penny323mo/account-rotator.git ~/account-rotator
 cd ~/account-rotator
-scripts/install.sh
+scripts/install.sh      # build → ~/Applications/Account Rotator.app → open
+scripts/make-dmg.sh     # build → dist/Account-Rotator-<version>.dmg
 ```
-
-會 build app 去 `~/Applications/Account Rotator.app`，並登記兩個背景服務（開機自動行）：
-`io.account-rotator.daemon`（查用量、轉帳號）同 `io.account-rotator.web`（控制台，只開放畀本機 `127.0.0.1:3082`）。
-
-This builds `~/Applications/Account Rotator.app` and registers two login services: `io.account-rotator.daemon`
-(usage and switching) and `io.account-rotator.web` (the console, on `127.0.0.1:3082` only).
 
 ## 第一次用 · First run
 

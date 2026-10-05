@@ -9,6 +9,7 @@ import json
 import math
 import re
 import subprocess
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -195,7 +196,7 @@ def normalize(data):
 
 
 class QuotaClient:
-    def __init__(self, profiles=None, binary=Path('/opt/homebrew/bin/agy')):
+    def __init__(self, profiles=None, binary=Path(shutil.which('agy') or '/opt/homebrew/bin/agy')):
         self.profiles = profiles or Profiles()
         self.binary = binary
         self.tokens = {}
