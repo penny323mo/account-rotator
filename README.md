@@ -94,12 +94,36 @@ scripts/make-dmg.sh     # build → dist/Account-Rotator-<version>.dmg
 3. 加夠兩個或以上帳號，就可以開「用盡自動轉」。
    With two or more accounts, turn on auto-switching.
 
+## 手機遙控 · Phone remote control
+
+預設關閉。喺 Mac 撳控制台右上角嘅手機圖示（或者 menu bar →「配對手機」）→ 開「開啟手機遙控」→ 揀連接方式 →
+「配對手機」，用手機相機掃 QR code，或者喺手機瀏覽器開顯示嘅網址再輸入配對碼。配對碼 5 分鐘內有效，只可以用一次。
+
+Off by default. On the Mac, click the phone icon at the top right of the console (or menu bar → 配對手機), turn on
+remote control, pick how the phone connects, then 配對手機: scan the QR code with the phone's camera, or open the
+shown address on the phone and type the code. A code works once, within 5 minutes.
+
+| 連接方式 · Connection | 點設定 · Setup |
+|---|---|
+| 同一個 Wi-Fi · Same Wi-Fi | 開「同一個 Wi-Fi」。普通 HTTP、冇加密：只喺屋企 Wi-Fi 用。· Turn on 同一個 Wi-Fi. Plain HTTP: home Wi-Fi only. |
+| Tailscale | Mac 同手機都裝 Tailscale 並登入同一個帳號，再開「Tailscale」。出街都用到，連線由 Tailscale 加密。· Install Tailscale on both and sign in to the same account, then turn on Tailscale. Works anywhere, encrypted by Tailscale. |
+| 自己嘅公開網址 · Your own public address | 用 ngrok、cloudflared 之類將 tunnel 指去 `127.0.0.1:3082`，再將佢嘅網址填入「公開網址」（偵測到 ngrok 會自動提議）。· Point an ngrok / cloudflared tunnel at `127.0.0.1:3082` and enter its address (a running ngrok is detected). |
+
+- 配對咗嘅手機預設只可以睇用量、轉帳號同暫停，睇唔到帳號 email。想用手機加帳號、改設定，要喺 Mac 開「手機可以加帳號、改設定」。
+  配對同移除裝置永遠只可以喺 Mac 做。
+  A paired phone may only view usage, switch and pause, and never sees account e-mail addresses; turn on full control
+  on the Mac to add accounts or change settings from it. Pairing and removing devices happen on the Mac only.
+- 配對咗嘅手機就等於你本人：手機唔見咗，即刻喺 Mac 嘅「已配對裝置」移除佢。90 日冇用過嘅裝置會自動失效。
+  A paired phone acts as you: if it is lost, remove it on the Mac right away. Devices unused for 90 days expire.
+- 用公開網址嘅話，ngrok 一類 tunnel 服務會睇到經過嘅內容。· With a public address, the tunnel service can see the traffic.
+
 ## 安全 · Security
 
-- 控制台只聽 `127.0.0.1`，自己冇登入功能：**唔好用 tunnel 或者 port forwarding 將 3082 公開出去**。
-  The console listens on `127.0.0.1` only and has no login of its own: **never expose port 3082 through a tunnel or port
-  forwarding**.
-- 手機遙控（連登入同配對）係之後嘅功能。· Remote control from a phone (with its own login and pairing) is planned.
+- 手機遙控關閉時，控制台只聽 `127.0.0.1`，只有呢部 Mac 用得。開咗之後，除咗呢部 Mac，所有連線都要係配對過嘅裝置。
+  With remote control off the console listens on `127.0.0.1` only. With it on, everything except this Mac must come
+  from a paired device.
+- 唔好用 port forwarding 將 3082 開放畀成個互聯網；要喺外面用，就用 Tailscale 或者 tunnel 加配對。
+  Do not port-forward 3082 to the internet; from outside, use Tailscale or a tunnel together with pairing.
 
 ## 移除 · Uninstall
 

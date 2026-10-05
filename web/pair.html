@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-Hant-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>配對 · Account Rotator</title>
+<link rel="icon" href="/agy/icon.svg"><link rel="manifest" href="/agy/manifest.webmanifest"><link rel="apple-touch-icon" href="/agy/apple-touch-icon.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Rotator">
+<link rel="stylesheet" href="/agy/style.css?v=remote-1">
+<script src="/agy/pair.js" defer></script>
+</head>
+<body class="pair-page">
+<main class="pair-box">
+  <img src="/agy/icon.svg" alt="" width="72" height="72">
+  <h1>Account Rotator</h1>
+  <p id="pairStatus" role="status">喺 Mac 嘅控制台撳右上角手機圖示 →「配對手機」，再用呢部手機掃 QR code，或者喺下面輸入配對碼。</p>
+  <form id="pairForm" class="pair-form"><input id="pairCode" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" aria-label="配對碼" maxlength="40"><button type="submit">配對</button></form>
+  <p class="muted" id="pairHint">配對碼 5 分鐘內有效，只可以用一次。</p>
+</main>
+</body>
+</html>

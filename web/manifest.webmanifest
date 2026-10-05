@@ -1,0 +1,13 @@
+{
+  "name": "Account Rotator",
+  "short_name": "Rotator",
+  "start_url": "/agy/",
+  "scope": "/agy/",
+  "display": "standalone",
+  "background_color": "#d9e8f2",
+  "theme_color": "#d9e8f2",
+  "icons": [
+    {"src": "/agy/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
+    {"src": "/agy/icon.svg", "sizes": "any", "type": "image/svg+xml"}
+  ]
+}

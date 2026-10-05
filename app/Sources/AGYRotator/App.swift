@@ -214,6 +214,16 @@ func clearBackground(_ view: WKWebView) {
     if view.responds(to: NSSelectorFromString("setDrawsBackground:")) { view.setValue(false, forKey: "drawsBackground") }
 }
 
+/// 配對手機 in the menu bar: the console opens (or comes forward) and shows its phone remote-control dialog.
+enum RemoteRequest {
+    static let notification = Notification.Name("AccountRotatorShowRemote")
+    static var pending = false
+    static func ask() {
+        pending = true
+        NotificationCenter.default.post(name: notification, object: nil)
+    }
+}
+
 struct WebConsole: NSViewRepresentable {
     static let url = URL(string: "http://127.0.0.1:3082/agy/")!
     @Binding var failed: Bool
@@ -224,6 +234,7 @@ struct WebConsole: NSViewRepresentable {
         let view = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
+        context.coordinator.view = view
         clearBackground(view)
         context.coordinator.lastReload = reload
         view.load(URLRequest(url: Self.url))
@@ -238,7 +249,19 @@ struct WebConsole: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let failed: Binding<Bool>
         var lastReload = 0
-        init(failed: Binding<Bool>) { self.failed = failed }
+        weak var view: WKWebView?
+        init(failed: Binding<Bool>) {
+            self.failed = failed
+            super.init()
+            NotificationCenter.default.addObserver(forName: RemoteRequest.notification, object: nil, queue: .main) { [weak self] _ in
+                self?.showRemote()
+            }
+        }
+        func showRemote() {
+            guard RemoteRequest.pending, let view, !view.isLoading else { return }  // else: after the page loads
+            RemoteRequest.pending = false
+            view.evaluateJavaScript("window.openRemote && window.openRemote()")
+        }
         /// Sign-in pages (OpenAI, Google) and any other site open in the default browser, not in this window.
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -254,7 +277,10 @@ struct WebConsole: NSViewRepresentable {
             if let url = action.request.url { NSWorkspace.shared.open(url) }
             return nil
         }
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { failed.wrappedValue = false }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            failed.wrappedValue = false
+            showRemote()
+        }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed.wrappedValue = true }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             failed.wrappedValue = true
@@ -377,6 +403,7 @@ struct MenuPanel: View {
             }
             HStack {
                 Button("開啟控制台", action: openConsole).keyboardShortcut("o")
+                Button("配對手機") { RemoteRequest.ask(); openConsole() }
                 Button("更新用量") { Task { await model.refresh() } }
                 Spacer()
                 Button("結束") { NSApp.terminate(nil) }.keyboardShortcut("q")

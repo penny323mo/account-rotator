@@ -1,7 +1,9 @@
 import http.client
 import importlib.util
 import json
+import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -82,3 +84,192 @@ class WebTests(unittest.TestCase):
             code, _, body=self.request(path=path)
             self.assertEqual(code,200)
             self.assertGreater(len(body),100)
+
+
+class RemoteTests(unittest.TestCase):
+    """Remote control on, with a public address (as a tunnel would use): pairing, limits, removal."""
+    PUBLIC = 'phone.test'
+
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        (Path(self.home.name) / 'remote.json').write_text(json.dumps({'enabled': True, 'public': self.PUBLIC}))
+        self.calls = []
+        def call(method, params):
+            self.calls.append((method, params))
+            return {'revision': 1, 'active': 'A', 'codex': {'profiles': {'CODEX_A': {'email': 'a@example.com', '5h': {}}}}}
+        self.restarts = []
+        self.server = web.Server(0, '', self.home.name, call, restart=lambda: self.restarts.append(1))
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def request(self, method='GET', path='/agy/api/status', body=None, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+        conn.request(method, path, body=body, headers=headers or {})
+        res = conn.getresponse()
+        result = res.status, dict(res.getheaders()), res.read()
+        conn.close()
+        return result
+
+    def local(self, method, params=None):
+        code, _, body = self.request('POST', '/agy/api/action', json.dumps({'method': method, 'params': params or {}}),
+                                     {'Content-Type': 'application/json', 'X-AGY-CSRF': self.server.csrf})
+        return code, json.loads(body)
+
+    def pair(self, code, host=None):
+        return self.request('POST', '/agy/api/pair', json.dumps({'code': code}),
+                            {'Content-Type': 'application/json', 'Host': host or self.PUBLIC,
+                             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)'})
+
+    def phone(self, cookie, method='refresh', params=None, host=None):
+        return self.request('POST', '/agy/api/action', json.dumps({'method': method, 'params': params or {}}),
+                            {'Content-Type': 'application/json', 'X-AGY-CSRF': self.server.csrf,
+                             'Host': host or self.PUBLIC, 'Cookie': cookie})[0]
+
+    def paired(self):
+        code = self.local('pair.start')[1]['result']['code']
+        status, headers, _ = self.pair(code)
+        self.assertEqual(status, 200)
+        return headers['Set-Cookie'].split(';')[0]
+
+    def test_unpaired_device_gets_the_pairing_page_not_the_console(self):
+        status, headers, _ = self.request(path='/agy/', headers={'Host': self.PUBLIC})
+        self.assertEqual((status, headers['Location']), (302, '/agy/pair'))
+        self.assertEqual(self.request(path='/agy/pair', headers={'Host': self.PUBLIC})[0], 200)
+        self.assertEqual(self.request(headers={'Host': self.PUBLIC})[0], 401)
+        self.assertEqual(self.calls, [])
+
+    def test_host_outside_the_list_is_refused(self):
+        self.assertEqual(self.request(path='/agy/pair', headers={'Host': 'evil.test'})[0], 403)
+        self.assertEqual(self.pair('x', host='evil.test')[0], 403)
+
+    def test_code_is_single_use_and_expires(self):
+        code = self.local('pair.start')[1]['result']['code']
+        self.assertEqual(self.pair(code)[0], 200)
+        self.assertEqual(self.pair(code)[0], 403)
+        code = self.local('pair.start')[1]['result']['code']
+        self.server.remote.pairing['expires'] = time.time() - 1
+        self.assertEqual(self.pair(code)[0], 403)
+
+    def test_typed_code_works_like_the_qr_code(self):
+        code = self.local('pair.start')[1]['result']['code']
+        self.assertRegex(code, r'^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$')
+        self.assertEqual(self.pair(' ' + code.replace('-', ' ').lower() + ' ')[0], 200)
+
+    def test_paired_phone_switches_but_cannot_add_accounts(self):
+        cookie = self.paired()
+        self.assertEqual(self.phone(cookie, 'use', {'label': 'B'}), 200)
+        self.assertEqual(self.calls[-1], ('use', {'label': 'B'}))
+        for method in ('accounts.add.start', 'accounts.remove', 'provider.reset', 'config.set', 'warmup.set',
+                       'codex.autocontinue.set', 'pair.start', 'devices.remove', 'remote.set', 'remote.info'):
+            self.assertEqual(self.phone(cookie, method), 403, method)
+
+    def test_full_control_opens_the_rest_but_never_pairing(self):
+        cookie = self.paired()
+        self.assertEqual(self.local('remote.set', {'full': True})[0], 200)
+        self.assertEqual(self.phone(cookie, 'config.defaults'), 200)
+        self.assertEqual(self.phone(cookie, 'pair.start'), 403)
+
+    def test_remote_status_has_no_email(self):
+        cookie = self.paired()
+        _, _, body = self.request(headers={'Host': self.PUBLIC, 'Cookie': cookie})
+        data = json.loads(body)
+        self.assertNotIn('email', json.dumps(data['status']))
+        self.assertEqual(data['remote'], {'local': False, 'full': False})
+        self.assertIn('a@example.com', self.request()[2].decode())  # on this Mac it is still shown
+
+    def test_removed_device_must_pair_again(self):
+        cookie = self.paired()
+        device = cookie.split('=', 1)[1].split('.')[0]
+        self.assertEqual(self.local('devices.remove', {'id': device})[0], 200)
+        self.assertEqual(self.phone(cookie), 401)
+        status, headers, _ = self.request(path='/agy/', headers={'Host': self.PUBLIC, 'Cookie': cookie})
+        self.assertEqual((status, headers['Location']), (302, '/agy/pair'))
+
+    def test_device_unused_for_90_days_expires(self):
+        cookie = self.paired()
+        devices = json.loads((Path(self.home.name) / 'devices.json').read_text())
+        for row in devices['devices'].values():
+            row['last_used'] = int(time.time()) - web.DEVICE_IDLE - 10
+        (Path(self.home.name) / 'devices.json').write_text(json.dumps(devices))
+        self.assertEqual(self.phone(cookie), 401)
+
+    def test_only_a_hash_is_stored_and_the_name_comes_from_the_browser(self):
+        cookie = self.paired()
+        stored = (Path(self.home.name) / 'devices.json').read_text()
+        self.assertNotIn(cookie.split('.', 1)[1], stored)
+        self.assertEqual([d['name'] for d in self.local('remote.info')[1]['result']['devices']], ['iPhone'])
+
+    def test_cookie_flags(self):
+        code = self.local('pair.start')[1]['result']['code']
+        cookie = self.pair(code)[1]['Set-Cookie']
+        for flag in ('agy_device=', 'HttpOnly', 'SameSite=Strict', 'Path=/agy', 'Secure'):  # public = HTTPS tunnel
+            self.assertIn(flag, cookie)
+
+    def test_wrong_codes_and_forged_cookies_are_rate_limited(self):
+        for _ in range(web.FAILURES):
+            self.assertEqual(self.pair('WRONG')[0], 403)
+        code = self.local('pair.start')[1]['result']['code']
+        self.assertEqual(self.pair(code)[0], 429)  # even the right code, for a minute
+        self.server.remote.failures.clear()
+        for _ in range(web.FAILURES):
+            self.assertEqual(self.phone('agy_device=abc.forged'), 401)
+        self.assertEqual(self.phone('agy_device=abc.forged'), 429)
+
+    def test_turning_remote_off_refuses_other_hosts_and_pairing(self):
+        cookie = self.paired()
+        self.assertEqual(self.local('remote.set', {'enabled': False})[0], 200)
+        self.assertEqual(self.phone(cookie), 403)
+        self.assertEqual(self.local('pair.start')[0], 409)
+
+    def test_settings_are_validated(self):
+        self.assertEqual(self.local('remote.set', {'lan': 'yes'})[0], 400)
+        self.assertEqual(self.local('remote.set', {'nope': True})[0], 400)
+        self.assertEqual(self.local('remote.set', {'public': 'bad host!'})[0], 400)
+        self.assertEqual(self.local('remote.set', {'public': 'https://Abc.ngrok-free.app/'})[1]['result']['public'],
+                         'abc.ngrok-free.app')
+
+
+class RemoteOffTests(unittest.TestCase):
+    def test_off_by_default_listens_on_loopback_only(self):
+        with tempfile.TemporaryDirectory() as home:
+            server = web.Server(0, '', home, lambda m, p: {})
+            try:
+                self.assertEqual(server.server_address[0], '127.0.0.1')
+                self.assertEqual((server.listen_addresses(), server.remote_hosts(), server.pair_urls()), ([], set(), []))
+            finally:
+                server.server_close()
+
+
+class LanTests(unittest.TestCase):
+    """Listening on the Wi-Fi: a client on the network is remote even when it claims Host 127.0.0.1."""
+    def setUp(self):
+        self.ips = web.lan_addresses()
+        if not self.ips:
+            self.skipTest('no private network address on this machine')
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        (Path(self.home.name) / 'remote.json').write_text(json.dumps({'enabled': True, 'lan': True}))
+        self.calls = []
+        self.server = web.Server(0, '', self.home.name, lambda m, p: self.calls.append(m) or {'revision': 1},
+                                 bind=self.ips[0], restart=lambda: None)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def get(self, host):
+        conn = http.client.HTTPConnection(self.ips[0], self.port, timeout=3)
+        conn.request('GET', '/agy/api/status', headers={'Host': host})
+        status = conn.getresponse().status
+        conn.close()
+        return status
+
+    def test_spoofed_local_host_from_the_network_is_refused(self):
+        self.assertEqual(self.get(f'127.0.0.1:{self.port}'), 403)
+
+    def test_the_wifi_address_needs_pairing(self):
+        self.assertEqual(self.get(f'{self.ips[0]}:{self.port}'), 401)
+        self.assertEqual(self.calls, [])
