@@ -270,10 +270,11 @@ class UnownedAgyTests(BrokerBase):
     def test_interactive_unowned_agy_refuses_before_lock_and_helper(self):
         b = self.make()
         with patch.object(broker_mod, 'unowned_agy', return_value=[(300, False)]), \
+             patch.object(broker_mod, 'working', return_value=[]), \
              patch.object(broker_mod.subprocess, 'run') as run:
             with self.assertRaises(QuotaError) as e:
                 b.switch('B', close_all=True)
-        self.assertEqual(str(e.exception), 'UNOWNED_AGY_NOT_SWITCHED')
+        self.assertEqual(str(e.exception), 'AGY_UNREADABLE_NOT_SWITCHED')
         run.assert_not_called()
         self.assertFalse(own.lock_state()['held'])
 

@@ -15,12 +15,14 @@ APP = '/Applications/Antigravity.app'
 # Helper refused before touching the live Keychain item: safe failures, no recovery needed.
 REFUSALS = {b'could not stop': 'CLOSE_TIMEOUT_NOT_SWITCHED', b'agy is running': 'AGY_RUNNING_NOT_SWITCHED',
             b'another account switch': 'SWITCH_BUSY'}
-NOT_SWITCHED = {'ACTIVATION_FAILED_ROLLED_BACK', 'UNOWNED_AGY_NOT_SWITCHED', *REFUSALS.values()}
+# Why an interactive agy nobody registered blocked a switch (the generic code stays for anything else).
+AGY_REFUSALS = {'AGY_WORKING_NOT_SWITCHED', 'AGY_CONVERSATION_PRUNED_NOT_SWITCHED', 'AGY_UNREADABLE_NOT_SWITCHED'}
+NOT_SWITCHED = {'ACTIVATION_FAILED_ROLLED_BACK', 'UNOWNED_AGY_NOT_SWITCHED', *AGY_REFUSALS, *REFUSALS.values()}
 # Refusals caused by agy the rotator does not own (it never terminates those): retry soon instead of the
 # 600 s cooldown, otherwise an exhausted account would stay un-rotated for 10 minutes behind one in-flight job.
 # A long unowned production --print job (up to its 180 s timeout) must not be fenced again every ~50 s:
 # every refusal that is caused by unowned agy waits >= 120 s.  SWITCH_BUSY (another switch) stays short.
-RETRY_AFTER = {'UNOWNED_AGY_NOT_SWITCHED': 120, 'CLOSE_TIMEOUT_NOT_SWITCHED': 120,
+RETRY_AFTER = {'UNOWNED_AGY_NOT_SWITCHED': 120, **{code: 120 for code in AGY_REFUSALS}, 'CLOSE_TIMEOUT_NOT_SWITCHED': 120,
                'AGY_RUNNING_NOT_SWITCHED': 120, 'SWITCH_BUSY': 20}
 assert agy_ownership.DRAIN_SECONDS + agy_ownership.SWITCH_BUDGET_SECONDS <= agy_ownership.LOCK_MAX_HOLD_SECONDS
 
@@ -175,14 +177,21 @@ class Broker:
                 # conversation is safely saved, quit it (any terminal) and report the command that resumes it;
                 # otherwise refuse before taking the lock so new invocations are not held up for a switch that
                 # cannot happen.  Unowned --print jobs are bounded: they get the helper's drain window.
+                busy = [r for r in working() if not r.startswith('agy_print:')]
+                if busy and not force:
+                    raise QuotaError('AGY_WORKING_NOT_SWITCHED')  # mid-turn: never quit it
                 try:
                     plan = self.parker.plan(interactive)
-                except (ParkError, OSError, ValueError, subprocess.SubprocessError):
+                except ParkError as e:
+                    if not force:
+                        # agy keeps only ~500 conversations: one it already pruned would be lost for good if quit
+                        # (an agy left open for a day while many `agy -p` jobs run).
+                        raise QuotaError('AGY_CONVERSATION_PRUNED_NOT_SWITCHED' if str(e) == 'AGY_CONVERSATION_NOT_SAVED'
+                                         else 'AGY_UNREADABLE_NOT_SWITCHED') from None
+                except (OSError, ValueError, subprocess.SubprocessError):
                     if not force:
                         raise QuotaError('UNOWNED_AGY_NOT_SWITCHED') from None
-                if [r for r in working() if not r.startswith('agy_print:')]:
-                    if not force:
-                        raise QuotaError('UNOWNED_AGY_NOT_SWITCHED')  # mid-turn: never quit it
+                if busy:
                     plan = []  # used up: switch anyway, but still never quit a session mid-turn
         # Short-lived rotation lock (agy_ownership.RotationLock): new agy invocations wait at start only while
         # this transaction runs (acquire -> close owned -> switch -> verify -> release); never held otherwise.

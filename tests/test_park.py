@@ -142,14 +142,27 @@ class BrokerParkTests(unittest.TestCase):
         with patch.object(broker_mod, 'working', return_value=['child:202']), self.helper():
             with self.assertRaises(QuotaError) as e:
                 self.b.switch('B', close_all=True)
-        self.assertEqual(str(e.exception), 'UNOWNED_AGY_NOT_SWITCHED')
+        self.assertEqual(str(e.exception), 'AGY_WORKING_NOT_SWITCHED')
         self.assertEqual(self.io.log, [])
 
-    def test_unreadable_session_still_refuses_without_touching_it(self):
-        self.io.saved = set()
-        with self.helper(), self.assertRaises(QuotaError):
+    def test_pruned_conversation_refuses_without_touching_it(self):
+        self.io.saved = set()  # agy already pruned it: quitting would lose it
+        with self.helper(), self.assertRaises(QuotaError) as e:
             self.b.switch('B', close_all=True)
+        self.assertEqual(str(e.exception), 'AGY_CONVERSATION_PRUNED_NOT_SWITCHED')
         self.assertEqual(self.io.log, [])
+
+    def test_unreadable_session_refuses_without_touching_it(self):
+        self.io.procs = {}
+        with self.helper(), self.assertRaises(QuotaError) as e:
+            self.b.switch('B', close_all=True)
+        self.assertEqual(str(e.exception), 'AGY_UNREADABLE_NOT_SWITCHED')
+        self.assertEqual(self.io.log, [])
+
+    def test_every_reason_counts_as_not_switched(self):
+        for code in broker_mod.AGY_REFUSALS:
+            self.assertIn(code, broker_mod.NOT_SWITCHED)
+            self.assertEqual(broker_mod.RETRY_AFTER[code], 120)
 
 
 class ForcedSwitchTests(BrokerParkTests):
