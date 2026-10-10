@@ -42,6 +42,9 @@ runs out, and start idle accounts' usage clocks.
   ChatGPT and the Codex CLI are closed, the account is switched, and ChatGPT is reopened.
 - **Claude Code**：直接換登入，行緊嘅 Claude Code 約 30 秒內自動跟住轉，唔使關。
   The login is swapped; running Claude Code sessions pick it up within ~30 s without being closed.
+  開咗 Remote Control（`/remote-control`）嘅 session 轉帳號後會自動重新登記，保留原本個名；要喺 **tmux** 入面行先做到，
+  其他終端機會通知你自己打 `/remote-control`。 · Sessions with Remote Control are re-registered under their own name after a
+  switch when they run inside **tmux**; for other terminals you are told to run `/remote-control` yourself.
 
 ## 要求 · Requirements
 

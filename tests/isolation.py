@@ -77,3 +77,30 @@ class InertParkIO:
 
 
 agy_park.SystemIO = InertParkIO
+
+
+import claude_remote  # noqa: E402
+
+
+class InertRemoteIO:
+    """No real Claude Code session is typed into from a test."""
+    def records(self):
+        return []
+
+    def alive(self, pid):
+        return False
+
+    def tmux(self, *a, **k):
+        raise OSError('TEST_ISOLATED')
+
+    def screen(self, *a):
+        raise OSError('TEST_ISOLATED')
+
+    def sleep(self, seconds):
+        pass
+
+    def now(self):
+        return 0
+
+
+claude_remote.SystemIO = InertRemoteIO

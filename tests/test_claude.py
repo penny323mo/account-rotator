@@ -81,6 +81,23 @@ class ClaudeServiceTests(unittest.TestCase):
         self.assertEqual(self.s.events[-1]['kind'], 'account_added')
         self.assertIsNone(self.s.status()['enrolling'])
 
+    def test_switch_reconnects_remote_control_and_logs_each_session(self):
+        import threading
+        done = threading.Event()
+        def run(report, before=None):
+            self.assertEqual(before, {1: {'name': 'Clawbook'}})  # noted before the switch
+            report({'name': 'Clawbook'}, 'session_new', None)
+            report({'name': 'Room'}, None, 'NO_TERMINAL')
+            done.set()
+        self.s.relinker = Mock(run=run, remote_sessions=Mock(return_value={1: {'name': 'Clawbook'}}))
+        self.s.refresh_claude(0)
+        self.claude.use.return_value = {'selected': 'CLAUDE_B', 'activation': 'OK'}
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        self.assertTrue(done.wait(2))
+        kinds = [(e['kind'], e.get('project'), e.get('error')) for e in self.s.events]
+        self.assertIn(('claude_remote_relinked', 'Clawbook', None), kinds)
+        self.assertIn(('claude_remote_failed', 'Room', 'NO_TERMINAL'), kinds)
+
     def test_manual_switch_records_and_marks_the_new_live_account(self):
         self.s.refresh_claude(0)
         self.claude.use.return_value = {'selected': 'CLAUDE_B', 'previous': 'CLAUDE_A'}

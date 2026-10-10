@@ -15,6 +15,7 @@ from broker import NOT_SWITCHED, RETRY_AFTER, Broker, atomic_json, working
 from codex import CodexAccounts
 from codex_watch import WatchIO
 from claude import ClaudeAccounts
+from claude_remote import Relinker
 from enroll import AccountAdder
 import re
 from quota import Profiles, QuotaClient, QuotaError, stamp, timestamp
@@ -217,7 +218,8 @@ def metrics(row, config, now):
 
 
 class Service:
-    def __init__(self, root, profiles=None, client=None, broker=None, busy=None, notifier=None, codex=None, watch_io=None, adder=None, claude=None):
+    def __init__(self, root, profiles=None, client=None, broker=None, busy=None, notifier=None, codex=None, watch_io=None, adder=None, claude=None,
+                 relinker=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
@@ -235,6 +237,7 @@ class Service:
         self.codex_lock = threading.Lock()
         self.watch_io = watch_io or WatchIO()
         self.claude = claude or ClaudeAccounts()
+        self.relinker = relinker or Relinker()
         self.claude_state = {'profiles': {}, 'active': None, 'updated_at': None, 'error': None, 'switching': False}
         self.claude_lock = threading.Lock()
         self.claude_next_poll = 0.0
@@ -604,12 +607,17 @@ class Service:
         try:
             with self.lock:
                 self.claude_state['switching'] = True
+            try:  # note the remote-controlled sessions before the switch, to bring each one back afterwards
+                remote_before = self.relinker.remote_sessions()
+            except Exception:
+                remote_before = None
             result = self.claude.use(label)
             with self.lock:
                 self.claude_state['active'] = result['selected']
                 for name, r in self.claude_state['profiles'].items():
                     r['active'] = name == result['selected']
                 self.event('claude_switched', selected=result['selected'], source=source)
+            threading.Thread(target=self.claude_relink, args=(remote_before,), daemon=True).start()
             return result
         except QuotaError as e:
             with self.lock:
@@ -620,6 +628,23 @@ class Service:
                 self.claude_state['switching'] = False
             self.claude_lock.release()
             self.refresh_requested.set()
+
+    def claude_relink(self, before=None):
+        """Remote Control links belong to the old account after a switch: register them again (see claude_remote)."""
+        def report(record, link, error):
+            with self.lock:
+                name = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+                if error:
+                    self.event('claude_remote_failed', project=name, error=error)
+                    if self.config['notify']:
+                        self.notifier(f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
+                else:
+                    self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
+        try:
+            self.relinker.run(report, before)
+        except Exception:
+            with self.lock:
+                self.event('claude_remote_failed', project='', error='RELINK_ERROR')
 
     def codex_auto(self, now):
         """Switch only when the live Codex account is used up and another one still has capacity."""
