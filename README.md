@@ -45,6 +45,8 @@ runs out, and start idle accounts' usage clocks.
   開咗 Remote Control（`/remote-control`）嘅 session 轉帳號後會自動重新登記，保留原本個名；要喺 **tmux** 入面行先做到，
   其他終端機會通知你自己打 `/remote-control`。 · Sessions with Remote Control are re-registered under their own name after a
   switch when they run inside **tmux**; for other terminals you are told to run `/remote-control` yourself.
+  間中有 session 冇察覺轉咗帳號，會繼續用舊帳號；app 會核對出嚟並通知你重開佢（`claude --resume`）。 · Now and then a
+  session misses the switch and stays on the old account; the app detects this and tells you to restart it (`claude --resume`).
 
 ## 要求 · Requirements
 

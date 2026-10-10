@@ -11,7 +11,9 @@ its tmux pane (sessions in other terminals cannot be typed into and are reported
   new link under the live account (without the name the phone lists it as "<hostname>-local-<random words>"). Every key after the first is sent only once the screen shows what it expects (Up at an
   empty prompt would recall the last message); anything unexpected is closed with Escape and reported.
 
-A new bridgeSessionId means it registered again. Sessions are never restarted: a session still busy after the time
+A new bridgeSessionId means it registered again, and only counts once the live login can see it: a session that has
+not noticed the switch (some never print "signed-in claude.ai account ... changed") registers under the OLD account,
+and only a restart (claude --resume) moves it. Sessions are never restarted: a session still busy after the time
 limit, or whose terminal cannot be found, is reported for the user to handle."""
 import glob
 import json
@@ -19,8 +21,11 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 
 SESSIONS = os.path.expanduser('~/.claude/sessions')
+API = 'https://api.anthropic.com/v1/code/sessions/'
 TMUX = next((p for p in ('/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux') if os.path.exists(p)), 'tmux')
 PICKUP = 45          # seconds for running sessions to pick up the new login before re-registering
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
@@ -59,6 +64,22 @@ class SystemIO:
         return subprocess.run([TMUX, 'capture-pane', '-p', '-t', pane], capture_output=True, text=True,
                               timeout=10, check=True).stdout
 
+    def owned(self, link):
+        """True when the live login can see this Remote Control link, False when it cannot, None when unknown."""
+        try:
+            raw = subprocess.run(['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-a',
+                                  os.environ.get('USER', ''), '-w'], capture_output=True, text=True, timeout=10).stdout
+            token = json.loads(raw)['claudeAiOauth']['accessToken']
+            req = urllib.request.Request(API + link, headers={
+                'Authorization': 'Bearer ' + token, 'anthropic-version': '2023-06-01',
+                'anthropic-beta': 'ccr-byoc-2025-07-29'})
+            urllib.request.urlopen(req, timeout=20).close()
+            return True
+        except urllib.error.HTTPError as e:
+            return False if e.code == 404 else None
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return None
+
     def sleep(self, seconds):
         time.sleep(seconds)
 
@@ -91,8 +112,12 @@ class Relinker:
         return '\n'.join(self.io.screen(where).rstrip().splitlines()[-lines:])
 
     def reregister(self, where, name=None):
-        """None when done, else an error code (the screen was not what the next key expects)."""
-        self.send(where, text='/remote-control')
+        """None when done, else an error code (the screen was not what the next key expects).
+        The name goes on every /remote-control: a connected session ignores it and opens the menu, a disconnected one
+        (Claude Code drops the link itself when it notices the account change) registers under it."""
+        name = ' '.join((name or '').split())
+        command = f'/remote-control {name}' if name else '/remote-control'
+        self.send(where, text=command)
         self.io.sleep(3)
         if MENU in self.bottom(where):  # it still holds a link (the old account's): disconnect it first
             self.send(where, 'up')
@@ -106,8 +131,7 @@ class Relinker:
             if MENU in self.bottom(where):
                 self.send(where, 'esc')
                 return 'MENU_UNEXPECTED'
-            name = ' '.join((name or '').split())
-            self.send(where, text=f'/remote-control {name}' if name else '/remote-control')
+            self.send(where, text=command)
         self.io.sleep(8)
         if MENU in self.bottom(where):  # connected already (nothing to disconnect after all): just close the menu
             self.send(where, 'esc')
@@ -142,7 +166,12 @@ class Relinker:
                     report(record, None, error)
                     continue
                 after = next((r for r in self.io.records() if r.get('pid') == pid), {}).get('bridgeSessionId')
-                report(record, after if after and after != before else None, None if after and after != before else 'NOT_RELINKED')
+                if not after or after == before:
+                    report(record, None, 'NOT_RELINKED')
+                elif self.io.owned(after) is False:
+                    report(record, None, 'OLD_LOGIN')  # registered under the previous account
+                else:
+                    report(record, after, None)
             if pending and self.io.now() - started > self.limit:
                 for record in pending.values():
                     report(record, None, 'STILL_BUSY')

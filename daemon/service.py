@@ -637,7 +637,9 @@ class Service:
                 if error:
                     self.event('claude_remote_failed', project=name, error=error)
                     if self.config['notify']:
-                        self.notifier(f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
+                        self.notifier(f"轉 Claude 帳號後，{name} 仲用緊舊帳號登入，遙控登記咗喺舊帳號：要重開佢（claude --resume）先會轉"
+                                      if error == 'OLD_LOGIN' else
+                                      f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
                 else:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
         try:

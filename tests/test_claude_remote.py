@@ -82,6 +82,11 @@ class FakeIO:
     def screen(self, pane):
         return self.sessions[self.panes[pane]].screen()
 
+    stale = ()
+
+    def owned(self, link):
+        return not any(link.startswith(f'new-{pid}-') for pid in self.stale)
+
     def sleep(self, seconds):
         self.clock += seconds
 
@@ -110,6 +115,7 @@ class RelinkerTests(unittest.TestCase):
         self.io.sessions[10].connected = False
         self.run_it()
         self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
+        self.assertEqual(self.io.sessions[10].title, 'Clawbook')  # named on the first /remote-control too
 
     def test_no_keys_when_the_menu_is_not_what_was_expected(self):
         orig = self.io.sessions[20].screen
@@ -144,6 +150,12 @@ class RelinkerTests(unittest.TestCase):
         before = {20: dict(self.io.records()[1])}
         self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err)), before)
         self.assertEqual([n for n, _, _ in self.reports], ['Control room'])
+
+    def test_session_still_on_the_old_login_is_reported_not_counted(self):
+        self.io.stale = (20,)  # it never noticed the switch: its new link belongs to the old account
+        self.run_it()
+        self.assertIn(('Control room', None, 'OLD_LOGIN'), self.reports)
+        self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
 
     def test_session_without_remote_control_is_left_alone(self):
         self.run_it()

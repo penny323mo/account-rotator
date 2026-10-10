@@ -84,6 +84,9 @@ import claude_remote  # noqa: E402
 
 class InertRemoteIO:
     """No real Claude Code session is typed into from a test."""
+    def owned(self, link):
+        return None
+
     def records(self):
         return []
 
