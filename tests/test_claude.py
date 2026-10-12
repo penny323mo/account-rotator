@@ -289,6 +289,22 @@ class ClaudeAutoContinueTests(ClaudeServiceTests.__base__):
         self.assertIn('claude_continue_error', self.kinds())
         self.assertNotIn('claude_continue_done', self.kinds())
 
+    def test_a_session_stopped_on_an_error_gets_continue_five_minutes_later(self):
+        from datetime import datetime, timezone
+        self.s.refresh_claude(0)
+        self.wait_idle()
+        self.s.relinker.resume.reset_mock()
+        stopped = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()
+        self.s.watch_io = Mock(recent_threads=Mock(return_value=[]))
+        self.s.relinker.sessions = Mock(return_value=[(self.record, False, 0)])
+        self.s.relinker.last_error.return_value = {'uuid': 'api-err', 'error': 'server_error',
+                                                   'text': 'API Error: 529 Overloaded.', 'timestamp': stopped}
+        self.s.check_session_errors(time.time())
+        self.wait_idle()
+        self.s.relinker.resume.assert_called_once_with(self.record)
+        self.assertIn('claude_session_error', self.kinds())
+        self.assertIn('claude_errorretry', self.kinds())
+
     def test_no_answer_for_half_an_hour_is_reported(self):
         self.s.relinker.last_reply = Mock(return_value=('err-1', True))
         self.s.refresh_claude(0)

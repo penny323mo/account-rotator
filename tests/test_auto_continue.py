@@ -149,6 +149,41 @@ class ContinueNowTests(unittest.TestCase):
         again.check_session_errors(now + 60)  # after a restart: not again
         self.assertNotIn('codex_session_error', [e['kind'] for e in again.events[len(self.s.events):]])
 
+    def error_stop(self, at, stop_at=None):
+        self.io.recent_threads.return_value = [{'thread': T1, 'cwd': '/work/shop-app', 'last': 'task_error',
+                                                'at': stop_at or at, 'name': '修 bug', 'error': 'Selected model is at capacity.'}]
+        self.s.relinker = Mock(sessions=Mock(return_value=[]))
+
+    def test_an_error_stop_gets_continue_five_minutes_later_once(self):
+        now = time.time()
+        self.error_stop(now, now - 60)
+        self.s.check_session_errors(now)
+        self.codex.continue_thread.assert_not_called()  # not yet
+        self.s.check_session_errors(now + 250)
+        self.wait()
+        self.assertEqual(self.codex.continue_thread.call_args[0][0], T1)  # the same thread, on the live account
+        self.assertIn('codex_errorretry', [e['kind'] for e in self.s.events])
+        self.s.check_session_errors(now + 400)
+        self.wait()
+        self.codex.continue_thread.assert_called_once()  # the same stop: not again
+
+    def test_nothing_is_sent_while_the_live_account_is_used_up(self):
+        now = time.time()
+        self.error_stop(now - 600)
+        self.s.codex_state['profiles']['CODEX_B'] = codex_row(five=0, active=True)
+        self.s.check_session_errors(now)
+        self.wait()
+        self.codex.continue_thread.assert_not_called()
+
+    def test_gives_up_after_three_stops_in_a_row(self):
+        now = time.time()
+        for i in range(4):
+            self.error_stop(now, now - 600 + i)  # each retry ended on the error again: a new stop
+            self.s.check_session_errors(now + i)
+            self.wait()
+        self.assertEqual(self.codex.continue_thread.call_count, 3)
+        self.assertEqual([e['kind'] for e in self.s.events].count('codex_errorretry_gaveup'), 1)
+
     def test_an_old_error_stop_is_not_news(self):
         now = time.time()
         self.io.recent_threads.return_value = [{'thread': T1, 'cwd': '/w/x', 'last': 'task_error', 'at': now - 7200,

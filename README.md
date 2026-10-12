@@ -63,7 +63,8 @@ runs out, and start idle accounts' usage clocks.
   for a session stopped on the limit).
 - Session 因為用量上限以外嘅錯誤停低（例如 model 爆滿、登入過期），表面睇似做完；app 會報出嚟並通知你。
   A session that stopped on an error other than the usage limit (model at capacity, expired login) looks finished;
-  the app reports it and notifies you.
+  the app reports it and notifies you. 停低嗰陣帳號仲有額度，5 分鐘後就會喺同一個 session 自動再送 continue（連續最多 3 次）。
+  If the account still had quota, "continue" goes into the same session 5 minutes later (at most 3 times in a row).
 - 已配對手機要開「手機可以加帳號、改設定」先用到 ▶，因為佢可以打字入你部機嘅終端機。
   A paired phone needs full control for ▶, since it types into terminals on this Mac.
 

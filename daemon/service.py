@@ -144,6 +144,8 @@ CODEX_COOLDOWN = 600  # seconds between Codex switches, so stale numbers cannot 
 CLAUDE_CONTINUE_GAP = 15 * 60  # a session that stops on the limit again is retried no sooner than this
 CLAUDE_CONTINUE_TRIES = 3      # ... and at most this often until it gets past the limit
 CLAUDE_REPLY_WAIT = 30 * 60    # "continue" typed but no answer after this long: reported
+ERROR_RETRY_AFTER = 5 * 60     # a session stopped on an error while its account still had quota gets "continue" this
+ERROR_RETRY_TRIES = 3          # long after it stopped (same session, live account), at most this many times in a row
 
 
 def transient(error):
@@ -302,6 +304,7 @@ class Service:
                 self.session_errors = {}
         except (OSError, ValueError):
             self.session_errors = {}
+        self.error_retries = {}  # 'codex:<thread>' / 'claude:<session>' -> {'stop': stop retried last, 'tries': n}
         # Is the live account busy? None = could not tell (never shown as idle).
         self.activity = {k: {'working': None, 'reasons': [], 'checked_at': None} for k in ('gemini', 'codex', 'claude')}
         try:
@@ -1083,15 +1086,15 @@ class Service:
 
     def check_session_errors(self, now, window=3600):
         """Codex threads and Claude sessions that stopped on an error other than the usage limit (the model at
-        capacity, a login that expired, ...) look finished from outside; each such stop is reported once
-        (codex_session_error / claude_session_error, with a notification). Only stops of the last hour: an old one
-        found after a restart is not news."""
-        found = []
+        capacity, a connection lost, a login that expired, ...) look finished from outside; each such stop is reported
+        once (codex_session_error / claude_session_error, with a notification). Only stops of the last hour: an old
+        one found after a restart is not news. Then each gets "continue" again (error_retry)."""
+        found = []  # (report key, kind, name, label, text, provider, session, stopped at, retry item)
         for t in self.watch_io.recent_threads(max_age=window):
             if t['last'] == 'task_error' and now - (t.get('at') or 0) <= window:
                 project = os.path.basename((t.get('cwd') or '').rstrip('/')) or t['thread'][-6:]
-                found.append((f"codex:{t['thread']}:{t['at']}", 'codex_session_error', 'Codex',
-                              t.get('name') or project, project, t.get('error') or ''))
+                found.append((f"codex:{t['thread']}:{t['at']}", 'codex_session_error', 'Codex', t.get('name') or project,
+                              t.get('error') or '', 'codex', t['thread'], t['at'], project))
         for record, _, _ in self.relinker.sessions():
             error = self.relinker.last_error(record['sessionId'])
             if not error:
@@ -1102,18 +1105,94 @@ class Service:
                 continue
             if now - at <= window:
                 project = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
-                found.append((f"claude:{record['sessionId']}:{error['uuid']}", 'claude_session_error', 'Claude',
-                              project, project, error['text'] or error.get('error') or ''))
+                found.append((f"claude:{record['sessionId']}:{error['uuid']}", 'claude_session_error', 'Claude', project,
+                              error['text'] or error.get('error') or '', 'claude', record['sessionId'], at, record))
         with self.lock:
             new = [f for f in found if f[0] not in self.session_errors]
-            for key, kind, name, label, project, text in new:
+            for key, kind, name, label, text, *_ in new:
                 self.session_errors[key] = now
                 self.event(kind, project=label, error=text[:200])
                 if self.config['notify']:
-                    self.notifier(f"{name} 喺 {label} 出錯停咗：{text[:120] or '未知錯誤'}。工作未完成，要接續請撳 ▶。")
+                    self.notifier(f"{name} 喺 {label} 出錯停咗：{text[:120] or '未知錯誤'}。工作未完成，"
+                                  f"{ERROR_RETRY_AFTER // 60} 分鐘後會自動再送 continue。")
             if new or any(now - v > 2 * 86400 for v in self.session_errors.values()):
                 self.session_errors = {k: v for k, v in self.session_errors.items() if now - v <= 2 * 86400}
                 self.save_session_errors()
+            stopped = {f'{f[5]}:{f[6]}' for f in found}
+            for k in [k for k in self.error_retries if k not in stopped]:
+                del self.error_retries[k]  # it moved on (answered, or someone typed): a later error starts again
+        for key, kind, name, label, text, provider, session, at, item in found:
+            if now - at >= ERROR_RETRY_AFTER:
+                self.error_retry(provider, session, key, label, item, now)
+
+    def error_retry(self, provider, session, stop, label, item, now):
+        """Type "continue" into a session that stopped on an error while its account still had quota (so not the usage
+        limit: something passing such as the model at capacity), on the live account, once per stop and at most
+        ERROR_RETRY_TRIES times in a row. Nothing is sent while the live account is used up (that is the quota
+        waiting's job) or while another continue / switch runs; it is tried again on the next poll."""
+        slot = f'{provider}:{session}'
+        with self.lock:
+            seen = self.error_retries.get(slot) or {'stop': None, 'tries': 0}
+            if seen['stop'] == stop:
+                return
+            if seen['tries'] >= ERROR_RETRY_TRIES:
+                if seen.get('gave_up') != stop:
+                    seen['gave_up'] = stop
+                    self.error_retries[slot] = seen
+                    self.event(f'{provider}_errorretry_gaveup', project=label, tries=seen['tries'])
+                    if self.config['notify']:
+                        self.notifier(f"{'Codex' if provider == 'codex' else 'Claude'} 喺 {label} 連續 "
+                                      f"{seen['tries']} 次出錯，唔再自動重試，請自己睇睇。")
+                return
+            if provider == 'codex':
+                state = self.codex_state
+                active = state['active']
+                if state['switching'] or self.codex_manual_continuing or not active \
+                        or codex_exhausted(state['profiles'].get(active) or {}):
+                    return
+                self.codex_manual_continuing = True
+            else:
+                state = self.claude_state
+                active = state['active']
+                if state['switching'] or self.claude_relinking or self.claude_continuing or not active \
+                        or not codex_available(state['profiles'].get(active) or {}):
+                    return
+                self.claude_continuing = True
+            self.error_retries[slot] = {'stop': stop, 'tries': seen['tries'] + 1}
+        if provider == 'codex':
+            cwd, model = self.codex_thread_info(session)
+            threading.Thread(target=self._codex_error_retry, args=({'thread': session, 'cwd': cwd, 'model': model},
+                                                                  active), daemon=True).start()
+        else:
+            threading.Thread(target=self._claude_error_retry, args=(item, label, active), daemon=True).start()
+
+    def _codex_error_retry(self, item, active):
+        try:
+            self.codex_continue([item], active, kind='codex_errorretry')
+        finally:
+            with self.lock:
+                self.codex_manual_continuing = False
+
+    def _claude_error_retry(self, record, name, selected):
+        try:
+            try:
+                reply, _ = self.relinker.last_reply(record['sessionId'])
+            except Exception:
+                reply = None
+            error = self.relinker.resume(record)
+            with self.lock:
+                if error:
+                    self.event('claude_autocontinue_failed', project=name, error=error)
+                else:
+                    self.claude_continued[record['sessionId']] = {'uuid': reply, 'tries': 0, 'at': time.time(),
+                                                                  'project': name, 'pending': True}
+                    self.event('claude_errorretry', project=name, selected=selected)
+        except Exception:
+            with self.lock:
+                self.event('claude_autocontinue_failed', project=name, error='CONTINUE_ERROR')
+        finally:
+            with self.lock:
+                self.claude_continuing = False
 
     def save_session_errors(self):
         try:
