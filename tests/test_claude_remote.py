@@ -65,7 +65,8 @@ class FakeIO:
         out = []
         for pid, m in self.meta.items():
             s = self.sessions.get(pid)
-            out.append({'pid': pid, 'status': self.status[pid], 'bridgeSessionId': s.link if s else None, **m})
+            out.append({'pid': pid, 'sessionId': f'sess-{pid}', 'status': self.status[pid],
+                        'bridgeSessionId': s.link if s else None, **m})
         return out
 
     def alive(self, pid):
@@ -82,7 +83,14 @@ class FakeIO:
     def screen(self, pane):
         return self.sessions[self.panes[pane]].screen()
 
+    def typed_screen(self, pane):
+        return self.sessions[self.panes[pane]].screen()
+
     stale = ()
+    limits = {}
+
+    def last_message(self, session_id):
+        return self.limits.get(session_id, ('u-1', False))
 
     def owned(self, link):
         return not any(link.startswith(f'new-{pid}-') for pid in self.stale)
@@ -92,6 +100,55 @@ class FakeIO:
 
     def now(self):
         return self.clock
+
+
+class LastOutputTests(unittest.TestCase):
+    def test_whole_last_round_skipping_the_limit_error_and_tool_calls(self):
+        import json, tempfile, claude_remote
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'proj').mkdir()
+            rows = [
+                {'type': 'assistant', 'timestamp': 't1', 'message': {'content': [{'type': 'text', 'text': '做完：3 個 test 過咗'}]}},
+                {'type': 'assistant', 'timestamp': 't2', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                {'type': 'assistant', 'timestamp': 't3', 'isApiErrorMessage': True, 'error': 'rate_limit',
+                 'message': {'content': [{'type': 'text', 'text': "You've hit your session limit"}]}}]
+            rows = [{'type': 'user', 'message': {'content': 'fix it'}},
+                    {'type': 'assistant', 'timestamp': 't0', 'message': {'content': [{'type': 'text', 'text': '上一輪'}]}},
+                    {'type': 'user', 'message': {'content': [{'type': 'text', 'text': 'run the tests'}]}},
+                    {'type': 'assistant', 'timestamp': 't0b', 'message': {'content': [{'type': 'text', 'text': '開始跑'}]}},
+                    {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}},
+                    {'type': 'user', 'isMeta': True, 'message': {'content': 'caveat'}}] + rows
+            (Path(d) / 'proj' / 'sid.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            old, claude_remote.PROJECTS = claude_remote.PROJECTS, d
+            try:
+                self.assertEqual(isolation.REAL_REMOTE_IO().last_output('sid'), ('開始跑\n\n做完：3 個 test 過咗', 't1'))
+            finally:
+                claude_remote.PROJECTS = old
+
+
+class LastErrorTests(unittest.TestCase):
+    def read(self, rows):
+        import json, tempfile, claude_remote
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'proj').mkdir()
+            (Path(d) / 'proj' / 'sid.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            old, claude_remote.PROJECTS = claude_remote.PROJECTS, d
+            try:
+                return isolation.REAL_REMOTE_IO().last_error('sid')
+            finally:
+                claude_remote.PROJECTS = old
+
+    def error(self, kind, text):
+        return {'type': 'assistant', 'uuid': 'e1', 'timestamp': 't', 'isApiErrorMessage': True, 'error': kind,
+                'message': {'content': [{'type': 'text', 'text': text}]}}
+
+    def test_overloaded_is_an_error_stop(self):
+        self.assertEqual(self.read([self.error('server_error', 'API Error: 529 Overloaded.')]),
+                         {'uuid': 'e1', 'error': 'server_error', 'text': 'API Error: 529 Overloaded.', 'timestamp': 't'})
+
+    def test_the_usage_limit_and_a_later_prompt_are_not(self):
+        self.assertIsNone(self.read([self.error('rate_limit', "You've hit your session limit")]))
+        self.assertIsNone(self.read([self.error('server_error', 'x'), {'type': 'user', 'message': {'content': 'retry'}}]))
 
 
 class RelinkerTests(unittest.TestCase):
@@ -156,6 +213,29 @@ class RelinkerTests(unittest.TestCase):
         self.run_it()
         self.assertIn(('Control room', None, 'OLD_LOGIN'), self.reports)
         self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
+
+    def test_session_stopped_on_the_limit_is_found_and_continued_at_an_empty_prompt(self):
+        self.io.limits = {'sess-10': ('err-1', True)}
+        stopped = self.r.stopped_sessions()
+        self.assertEqual({pid: uuid for pid, (_, uuid) in stopped.items()}, {10: 'err-1'})
+        self.assertIsNone(self.r.resume(stopped[10][0]))
+        self.assertEqual(self.io.sessions[10].history, ['continue'])
+
+    def test_own_text_is_typed_instead_of_continue(self):
+        self.io.limits = {'sess-10': ('err-1', True)}
+        self.assertIsNone(self.r.resume(self.r.stopped_sessions()[10][0], '繼續'))
+        self.assertEqual(self.io.sessions[10].history, ['繼續'])
+
+    def test_busy_session_is_not_counted_as_stopped(self):
+        self.io.limits = {'sess-10': ('err-1', True)}
+        self.io.status[10] = 'busy'
+        self.assertEqual(self.r.stopped_sessions(), {})
+
+    def test_nothing_is_typed_over_a_draft_or_a_menu(self):
+        self.io.sessions[20].menu = True
+        record = next(r for r in self.io.records() if r['pid'] == 20)
+        self.assertEqual(self.r.resume(record), 'PROMPT_NOT_READY')
+        self.assertEqual(self.io.sessions[20].history, [])
 
     def test_session_without_remote_control_is_left_alone(self):
         self.run_it()

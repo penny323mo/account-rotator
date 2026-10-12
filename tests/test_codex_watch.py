@@ -104,6 +104,23 @@ class CodexWatchTests(unittest.TestCase):
         self.assertIn('my-project', self.notes[-1])
         self.assertEqual(self.s.events[-1]['kind'], 'codex_continue_done')
 
+    def test_turn_that_ended_on_the_usage_limit_is_not_reported_done(self):
+        # 2026-10-11 14:50: the continued turn hit the limit and the page said "接續完成"
+        self.add()
+        self.io.state.update(last='task_failed', message=None)
+        self.io.busy = False
+        self.s.check_codex_watches()
+        self.assertEqual(self.watch()['status'], 'limited')
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_continue_limited')
+        self.assertIn('額度上限', self.notes[-1])
+
+    def test_turn_that_ended_without_an_answer_is_not_reported_done(self):
+        self.add()
+        self.io.state.update(last='task_complete', message=None)
+        self.io.busy = False
+        self.s.check_codex_watches()
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_continue_limited')
+
     def test_cli_gone_before_completion_is_interrupted(self):
         self.add()
         self.io.alive = False

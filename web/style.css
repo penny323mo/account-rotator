@@ -220,10 +220,10 @@ body:not(.settings-open) .section-heading{margin-bottom:4px}
 #message,#failure{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom) + 100px);z-index:45;width:max-content;max-width:calc(100% - 32px);margin:0;padding:10px 16px;border-radius:20px;font-size:13px;border:1px solid #ffffffd0;backdrop-filter:blur(18px) saturate(1.8);-webkit-backdrop-filter:blur(18px) saturate(1.8);box-shadow:inset 0 1px 2px #fff,0 10px 26px #1d3a6633}
 #message{background:linear-gradient(135deg,#f1fbf5e6,#e4f5ebcc);color:#157a45}
 #failure{background:linear-gradient(135deg,#fff5e6ee,#ffeccfd9);color:#8a5a12}
-#codexAutoContinue{flex-shrink:0;font-size:0;min-width:51px;width:51px;height:31px;min-height:31px;border-radius:16px;padding:0;position:relative;border:0;background:#a7b3c56b;box-shadow:inset 0 1px 3px #182c4838;transition:background .2s}
-#codexAutoContinue:after{content:"";position:absolute;width:27px;height:27px;border-radius:50%;background:#fff;left:2px;top:2px;box-shadow:0 2px 5px #122f4a40;transition:transform .22s cubic-bezier(.22,1,.36,1)}
-#codexAutoContinue[aria-checked=true]{background:#31c56a}
-#codexAutoContinue[aria-checked=true]:after{transform:translateX(20px)}
+#codexAutoContinue,#codexWaitContinue,#claudeWaitContinue{flex-shrink:0;font-size:0;min-width:51px;width:51px;height:31px;min-height:31px;border-radius:16px;padding:0;position:relative;border:0;background:#a7b3c56b;box-shadow:inset 0 1px 3px #182c4838;transition:background .2s}
+#codexAutoContinue:after,#codexWaitContinue:after,#claudeWaitContinue:after{content:"";position:absolute;width:27px;height:27px;border-radius:50%;background:#fff;left:2px;top:2px;box-shadow:0 2px 5px #122f4a40;transition:transform .22s cubic-bezier(.22,1,.36,1)}
+#codexAutoContinue[aria-checked=true],#codexWaitContinue[aria-checked=true],#claudeWaitContinue[aria-checked=true]{background:#31c56a}
+#codexAutoContinue[aria-checked=true]:after,#codexWaitContinue[aria-checked=true]:after,#claudeWaitContinue[aria-checked=true]:after{transform:translateX(20px)}
 
 /* Add-account button + glass dialog. */
 .heading-right{display:inline-flex;align-items:center;gap:8px}
@@ -316,3 +316,26 @@ header{align-items:center}.remote-dialog{width:min(420px,calc(100% - 24px));max-
 @media(prefers-reduced-motion:reduce){#remoteDialog input[type=checkbox],#remoteDialog input[type=checkbox]:before{transition:none}}
 /* The phone icon sits above the connection light, so the provider tabs keep their width. */
 .header-status{display:flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0}.header-status .remote-open{margin:0;width:28px;height:28px;min-height:28px}
+
+.in-use-row{display:flex;align-items:center;justify-content:space-between;gap:3px;width:calc(100% + 4px);margin-right:-4px}
+.card-bottom .in-use-row .in-use{width:auto!important;flex:0 0 auto;padding:4px 0!important;white-space:nowrap}
+.card-bottom .continue-now,.card-bottom .continue-now{position:relative;flex:none;width:26px!important;height:26px;min-height:26px!important;padding:0!important;border-radius:50%;display:grid;place-items:center;color:#0a7cf0;background:linear-gradient(140deg,#ffffffb0,#ffffff40 55%,#ffffff70);border:1px solid #ffffffc8;box-shadow:inset 0 1px 1px #fff,0 2px 6px #2a4a6a24}
+.card-bottom .continue-now svg{width:13px;height:13px;fill:currentColor;margin-left:2px}
+.card-bottom .continue-now:disabled{opacity:.35}
+.continue-now .n{position:absolute;top:-6px;right:-3px;min-width:15px;height:15px;padding:0 3px;border-radius:8px;background:#ff9f0a;color:#fff;font-size:9px;line-height:15px;font-weight:700}
+#codexAccounts .card-bottom .continue-now:disabled,#claudeAccounts .card-bottom .continue-now:disabled{opacity:.4}
+#continueConfirmText{white-space:pre-line;font-size:13px;line-height:1.45;color:var(--muted);text-align:left;margin:0 4px 18px}
+.continue-text{display:block;font-size:12px;font-weight:650;color:var(--muted);margin:0 4px 16px;text-align:left}
+.continue-text textarea{display:block;box-sizing:border-box;width:100%;margin-top:6px;padding:8px 10px;border-radius:12px;border:1px solid #c9d8ea;background:#ffffffcc;font:inherit;font-size:15px;font-weight:400;color:var(--ink,#111);resize:vertical}
+.continue-text #continueTextCount{display:block;text-align:right;font-weight:400;margin-top:3px}
+.continue-output{margin:0 4px 12px;text-align:left}
+.continue-output small{display:block;font-size:11px;font-weight:650;color:var(--muted);margin-bottom:4px}
+#continueOutput{margin:0;max-height:38vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;padding:8px 10px;border-radius:12px;background:#ffffff99;border:1px solid #d6e2ef;color:#1d2a38}
+#continueOutput:empty{display:none}
+.continue-output .out-bar{display:flex;gap:6px;justify-content:flex-start;margin-bottom:6px}
+.continue-output .out-bar button{min-height:28px}
+#continueTarget{display:block;box-sizing:border-box;width:100%!important;max-width:none!important;margin-top:6px;padding:8px 10px;border-radius:12px;border:1px solid #c9d8ea;background:#ffffffcc;font:inherit;font-size:15px;font-weight:400;color:#1d2a38}
+/* The ▶ dialog can be taller than a phone screen: it scrolls inside, the 取消 / 送出 buttons stay in view. */
+#continueConfirm{max-height:calc(100dvh - 24px);overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding-bottom:0}
+#continueConfirm .actions{position:sticky;bottom:0;margin:0 -18px;padding:10px 18px 16px;background:linear-gradient(#eef5fc00,#eef5fcf2 30%);z-index:1}
+#continueOutput{max-height:32vh}

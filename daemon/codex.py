@@ -74,9 +74,11 @@ class CodexAccounts:
         """One tiny `codex exec` as an idle account in a throwaway CODEX_HOME (live login untouched)."""
         return parse_warm(self._run('warm', label, timeout=150))
 
-    def continue_thread(self, thread, model=None):
-        """Resume a thread in tmux with its own permissions; ChatGPT is closed first, then reopened."""
-        args = ['continue', thread, '--close-app'] + (['--model', model] if model else [])
+    def continue_thread(self, thread, model=None, prompt=None):
+        """Resume a thread in tmux with its own permissions and send `prompt` ("continue" by default); ChatGPT is
+        closed first, then reopened."""
+        args = ['continue', thread, '--close-app'] + (['--model', model] if model else []) \
+            + (['--prompt', prompt] if prompt else [])
         proc = self._run(*args, timeout=120)
         try:
             if proc.returncode:

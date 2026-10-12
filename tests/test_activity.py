@@ -112,6 +112,62 @@ class CodexWorkingTests(unittest.TestCase):
 
 
 class ResumedTurnTests(unittest.TestCase):
+    def test_thread_names_latest_entry_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'session_index.jsonl').write_text(
+                json.dumps({'id': 'a', 'thread_name': '舊名'}) + '\n' + json.dumps({'id': 'a', 'thread_name': '新名'}) + '\n'
+                + 'not json\n' + json.dumps({'id': 'b', 'thread_name': 'notes2'}) + '\n')
+            self.assertEqual(WatchIO(d).thread_names(), {'a': '新名', 'b': 'notes2'})
+
+    def test_last_output_is_the_whole_last_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            day = Path(d) / 'sessions' / '2026' / '10' / '12'
+            day.mkdir(parents=True)
+            f = day / 'rollout-2026-10-12T00-00-00-tid1.jsonl'
+            msg = lambda role, t, ts: json.dumps({'timestamp': ts, 'type': 'response_item', 'payload': {
+                'type': 'message', 'role': role, 'content': [{'type': 'output_text', 'text': t}]}}) + '\n'
+            f.write_text(json.dumps({'payload': {'id': 'tid1'}}) + '\n' + msg('user', 'fix it', 't0')
+                         + msg('assistant', '舊答案', 't1') + msg('user', 'continue', 't2')
+                         + msg('assistant', '先睇 log', 't3')
+                         + json.dumps({'payload': {'type': 'function_call', 'name': 'shell'}}) + '\n'
+                         + msg('assistant', '**新答案**\n第二段\n<oai-mem-citation>\n<rollout_ids>x</rollout_ids>\n</oai-mem-citation>', 't4')
+                         + json.dumps({'payload': {'type': 'task_complete'}}) + '\n')
+            self.assertEqual(WatchIO(d).last_output('tid1'), ('先睇 log\n\n**新答案**\n第二段', 't4'))
+            # a round that stopped before saying anything shows the round before it
+            f.write_text(f.read_text() + msg('user', 'continue', 't5'))
+            self.assertEqual(WatchIO(d).last_output('tid1'), ('先睇 log\n\n**新答案**\n第二段', 't4'))
+
+    def test_an_error_that_is_not_the_usage_limit_is_task_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'rollout.jsonl'
+            done = lambda e: json.dumps({'timestamp': '2026-10-12T11:58:58Z', 'payload': {
+                'type': 'task_complete', 'last_agent_message': None, 'error': e}}) + '\n'
+            f.write_text(done({'message': "You've hit your usage limit.", 'codex_error_info': 'usage_limit_exceeded'}))
+            self.assertEqual(WatchIO(d).turn(str(f))[0], 'task_failed')
+            f.write_text(done({'message': 'Selected model is at capacity. Please try a different model.',
+                               'codex_error_info': 'server_overloaded'}))
+            io = WatchIO(d)
+            self.assertEqual(io.turn(str(f))[0], 'task_error')
+            self.assertEqual(io.turn_error(str(f)), 'Selected model is at capacity. Please try a different model.')
+
+    def test_stopped_at_is_when_the_turn_ended_not_the_file_mtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'rollout.jsonl'
+            f.write_text(json.dumps({'timestamp': '2026-10-12T02:58:24.650Z', 'payload': {'type': 'task_complete'}}) + '\n'
+                         + json.dumps({'timestamp': '2026-10-12T06:20:32.830Z',
+                                       'payload': {'type': 'thread_settings_applied'}}) + '\n')
+            from datetime import datetime, timezone
+            self.assertEqual(WatchIO(d).stopped_at(str(f)),
+                             datetime(2026, 10, 12, 2, 58, 24, 650000, tzinfo=timezone.utc).timestamp())
+
+    def test_turn_ended_by_the_usage_limit_is_failed_not_complete(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'rollout.jsonl'
+            f.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started'}}) + '\n'
+                         + json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete', 'last_agent_message': None,
+                                       'error': {'message': "You've hit your usage limit."}}}) + '\n')
+            self.assertEqual(WatchIO(d).turn(str(f)), ('task_failed', None))
+
     def test_only_turns_written_after_the_resume_count(self):
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / 'rollout.jsonl'

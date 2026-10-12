@@ -30,6 +30,9 @@ runs out, and start idle accounts' usage clocks.
 | 手動切換 · Manual switch | ✓ | ✓ | ✓ |
 | 用盡自動轉 · Auto-switch when used up | ✓ | ✓ | — |
 | 轉帳號後自動接續對話 · Continue after a switch | 提供接返指令 · resume command | ✓ | — |
+| 額度恢復後自動接續 · Continue once quota returns | — | ✓ | ✓ |
+| ▶ 向 session 送 prompt · ▶ Send a prompt to a session | ✓（tmux） | ✓ | ✓（tmux） |
+| 出錯停咗會通知 · Report sessions stopped on an error | — | ✓ | ✓ |
 | 自動喚醒閒置帳號 · Wake idle accounts | ✓ | ✓ | ✓ |
 | 一鍵重設 · One-tap reset | ✓ | ✓ | ✓ |
 
@@ -47,6 +50,22 @@ runs out, and start idle accounts' usage clocks.
   switch when they run inside **tmux**; for other terminals you are told to run `/remote-control` yourself.
   間中有 session 冇察覺轉咗帳號，會繼續用舊帳號；app 會核對出嚟並通知你重開佢（`claude --resume`）。 · Now and then a
   session misses the switch and stays on the old account; the app detects this and tells you to restart it (`claude --resume`).
+
+**接續同 ▶ · Continuing and ▶**
+
+- 手動轉帳號唔會自動做任何嘢；「轉帳號後自動接續」只喺用盡自動轉之後先接續，「額度恢復後自動接續」就算關咗自動轉都會做。
+  A switch by hand never continues anything by itself; "continue after a switch" follows only an automatic switch, and
+  "continue once quota returns" works even with auto-switch off.
+- 使用中卡上面嘅 ▶：揀一個 session（Claude：所有行緊嘅；Codex／Antigravity：過去 24 小時有活動嘅），睇佢上一輪嘅完整
+  output，再送 prompt（最多 10000 字，撞上限嘅 session 預設係「continue」）。
+  ▶ on the live account's card: pick a session (Claude: every running one; Codex / Antigravity: active in the last
+  24 hours), read its whole last round of output, and send a prompt (up to 10000 characters; "continue" is prefilled
+  for a session stopped on the limit).
+- Session 因為用量上限以外嘅錯誤停低（例如 model 爆滿、登入過期），表面睇似做完；app 會報出嚟並通知你。
+  A session that stopped on an error other than the usage limit (model at capacity, expired login) looks finished;
+  the app reports it and notifies you.
+- 已配對手機要開「手機可以加帳號、改設定」先用到 ▶，因為佢可以打字入你部機嘅終端機。
+  A paired phone needs full control for ▶, since it types into terminals on this Mac.
 
 ## 要求 · Requirements
 

@@ -34,7 +34,7 @@ from quota import QuotaError
 
 ASSETS = Path(__file__).parent
 METHODS = {'refresh', 'enabled.set', 'config.set', 'config.defaults', 'use',
-           'cancel', 'pause', 'resume', 'recovery.ack', 'codex.use', 'codex.auto.set', 'codex.autocontinue.set', 'warmup.set', 'accounts.add.start', 'accounts.add.finish', 'accounts.add.cancel', 'accounts.remove', 'provider.reset', 'claude.use'}
+           'cancel', 'pause', 'resume', 'recovery.ack', 'codex.use', 'codex.auto.set', 'codex.autocontinue.set', 'warmup.set', 'accounts.add.start', 'accounts.add.finish', 'accounts.add.cancel', 'accounts.remove', 'provider.reset', 'claude.use', 'claude.waitcontinue.set', 'codex.waitcontinue.set', 'codex.continue.now', 'claude.continue.now', 'agy.continue.now', 'continue.preview', 'continue.sessions'}
 # What a paired device may do unless full control is on.
 REMOTE_METHODS = {'refresh', 'use', 'codex.use', 'claude.use', 'pause', 'resume', 'cancel'}
 # Handled here, never by the daemon, and only on this Mac.
@@ -490,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
             raise LookupError('JSON_REQUIRED')
         length = int(self.headers.get('Content-Length', '0'))
-        if not 0 < length <= 16384 or self.headers.get('Transfer-Encoding'):
+        if not 0 < length <= 65536 or self.headers.get('Transfer-Encoding'):
             raise ValueError()
         return json.loads(self.rfile.read(length))
 

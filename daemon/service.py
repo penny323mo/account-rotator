@@ -13,9 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from broker import NOT_SWITCHED, RETRY_AFTER, Broker, atomic_json, working
 from codex import CodexAccounts
-from codex_watch import WatchIO
+from codex_watch import WatchIO, timestamp_of
 from claude import ClaudeAccounts
-from claude_remote import Relinker
+from claude_remote import PICKUP, Relinker
+from agy_continue import AgyContinue
 from enroll import AccountAdder
 import re
 from quota import Profiles, QuotaClient, QuotaError, stamp, timestamp
@@ -140,12 +141,27 @@ def why(label, usable, weekly, weekly_reset, now):
 
 
 CODEX_COOLDOWN = 600  # seconds between Codex switches, so stale numbers cannot ping-pong accounts
+CLAUDE_CONTINUE_GAP = 15 * 60  # a session that stops on the limit again is retried no sooner than this
+CLAUDE_CONTINUE_TRIES = 3      # ... and at most this often until it gets past the limit
+CLAUDE_REPLY_WAIT = 30 * 60    # "continue" typed but no answer after this long: reported
 
 
 def transient(error):
     """Network / rate-limit / server-side errors that usually clear on the next poll (not auth problems)."""
     return (error in ('NETWORK_UNAVAILABLE', 'INVALID_RESPONSE', 'RESPONSE_TOO_LARGE', 'QUOTA_INTERNAL_ERROR')
             or error.endswith(('_HTTP_429', '_HTTP_500', '_HTTP_502', '_HTTP_503', '_HTTP_504')))
+
+
+def continue_text(value):
+    """What the page's continue button sends: "continue" unless the user typed something else (one line)."""
+    if value is None:
+        return 'continue'
+    if not isinstance(value, str):
+        raise QuotaError('INVALID_TEXT')
+    text = ' '.join(value.split())
+    if not text or len(text) > 10000:
+        raise QuotaError('INVALID_TEXT')
+    return text
 
 
 def codex_exhausted(r):
@@ -219,7 +235,7 @@ def metrics(row, config, now):
 
 class Service:
     def __init__(self, root, profiles=None, client=None, broker=None, busy=None, notifier=None, codex=None, watch_io=None, adder=None, claude=None,
-                 relinker=None):
+                 relinker=None, agy_continue=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
@@ -233,12 +249,32 @@ class Service:
         self.busy = busy or (lambda: working(ignore_until=self.own_agy_until))
         self.codex = codex or CodexAccounts()
         self.codex_state = {'profiles': {}, 'active': None, 'updated_at': None, 'error': None, 'switching': False,
-                            'auto': False, 'autocontinue': False}
+                            'auto': False, 'autocontinue': False, 'waitcontinue': True, 'stopped': []}
+        self.codex_manual_continuing = False
         self.codex_lock = threading.Lock()
         self.watch_io = watch_io or WatchIO()
         self.claude = claude or ClaudeAccounts()
         self.relinker = relinker or Relinker()
-        self.claude_state = {'profiles': {}, 'active': None, 'updated_at': None, 'error': None, 'switching': False}
+        self.claude_target = None  # {'sessionId', 'at'}: the session ▶ keeps talking to
+        self.agy_target = None     # the agy session ▶ keeps talking to
+        try:  # kept across restarts
+            saved = json.loads((self.root / 'continue_targets.json').read_text())
+            self.claude_target, self.agy_target = saved.get('claude'), saved.get('agy')
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.agy_continue = agy_continue or AgyContinue()
+        self.agy_stopped = []  # interactive agy sessions stopped on the usage limit (the page's ▶ button)
+        self.agy_continuing = False
+        self.claude_state = {'profiles': {}, 'active': None, 'updated_at': None, 'error': None, 'switching': False,
+                             'waitcontinue': True, 'stopped': []}
+        try:
+            self.claude_state['waitcontinue'] = json.loads((self.root / 'claude.json').read_text()).get('waitcontinue') is not False
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.claude_waiting = False
+        self.claude_relinking = False
+        self.claude_continued = {}  # session id -> {'uuid', 'tries', 'at'}: what was already continued
+        self.claude_continuing = False
         self.claude_lock = threading.Lock()
         self.claude_next_poll = 0.0
         self.claude_interval, self.claude_good = 0, 0  # 0 = the normal poll_seconds
@@ -253,12 +289,26 @@ class Service:
             self.codex_watches = []
         self.last_codex_switch = 0
         self.codex_all_exhausted = False
+        try:  # threads stopped while every Codex account was used up; continued once quota returns
+            self.codex_waiting = json.loads((self.root / 'codex_waiting.json').read_text())
+            if not isinstance(self.codex_waiting, list):
+                self.codex_waiting = []
+        except (OSError, ValueError):
+            self.codex_waiting = []
+        self.codex_all_exhausted = bool(self.codex_waiting)  # already reported before a restart
+        try:  # sessions already reported as stopped on an error: {key: when}, so a restart does not report them again
+            self.session_errors = json.loads((self.root / 'session_errors.json').read_text())
+            if not isinstance(self.session_errors, dict):
+                self.session_errors = {}
+        except (OSError, ValueError):
+            self.session_errors = {}
         # Is the live account busy? None = could not tell (never shown as idle).
         self.activity = {k: {'working': None, 'reasons': [], 'checked_at': None} for k in ('gemini', 'codex', 'claude')}
         try:
             saved = json.loads((self.root / 'codex.json').read_text())
             self.codex_state['auto'] = saved.get('auto') is True
             self.codex_state['autocontinue'] = saved.get('autocontinue') is True
+            self.codex_state['waitcontinue'] = saved.get('waitcontinue') is not False
         except (OSError, ValueError, AttributeError):
             pass
         self.warmup = {'gemini': True, 'codex': True, 'claude': True}
@@ -326,6 +376,13 @@ class Service:
             self.recovery_required = True
             self.transaction = {'phase': 'UNKNOWN', 'error': 'SAVED_STATE_UNREADABLE'}
 
+    def autocontinue_event(self, project, selected, kind='codex_autocontinue'):
+        """The continue script already logged codex_continue_started for this thread: one line per continue."""
+        last = self.events[-1] if self.events else {}
+        if last.get('kind') == 'codex_continue_started' and last.get('project') == project:
+            self.events.pop()
+        self.event(kind, project=project, selected=selected)
+
     def event(self, kind, **details):
         item = {'time': stamp(), 'kind': kind, **details}
         self.events = (self.events + [item])[-100:]
@@ -335,6 +392,8 @@ class Service:
                     'park_countdown_started': '每週額度低過 15%，倒數後轉去其他帳號，留低呢個做後備。可在 App 取消。',
                     'switched': '帳號切換完成。', 'switch_failed': '帳號切換失敗，請查看 App 狀態。',
                     'codex_all_exhausted': 'Codex 所有帳號都已用盡，未有自動切換。',
+                    'codex_waiting_quota': 'Codex 用緊嘅帳號用盡：佢恢復額度就會自動接續停咗嘅對話。',
+                    'claude_waiting_quota': 'Claude 用緊嘅帳號撞到用量上限：額度恢復就會自動喺停咗嘅 session 打 continue。',
                     'codex_switch_failed': 'Codex 帳號切換失敗，請查看 App 狀態。'}
         if self.config['notify'] and kind in messages:
             self.notifier(messages[kind])
@@ -413,6 +472,7 @@ class Service:
                     'recommended': self.recommend(now),
                     'transaction': copy.deepcopy(self.transaction),
                     'codex': {**copy.deepcopy(self.codex_state), 'recommended': self.recommend_other(self.codex_state, now)},
+                    'agy_stopped': copy.deepcopy(self.agy_stopped), 'agy_target': copy.deepcopy(self.agy_target),
                     'codex_watches': copy.deepcopy(self.codex_watches[-10:]),
                     'codex_events': copy.deepcopy([e for e in self.events if e['kind'].startswith('codex_')][-10:]),
                     'claude': {**copy.deepcopy(self.claude_state), 'recommended': self.recommend_other(self.claude_state, now)},
@@ -490,11 +550,17 @@ class Service:
         try:
             if scope in (None, 'gemini'):
                 self._refresh_gemini()
+                self.agy_refresh_stopped()
         finally:
             if scope in (None, 'codex'):
                 self.refresh_codex()
             if scope in (None, 'claude'):
                 self.refresh_claude(force=scope == 'claude')
+            if scope is None:
+                try:
+                    self.check_session_errors(time.time())
+                except Exception:
+                    pass  # a report only; never breaks polling
             with self.lock:
                 self.refreshing = False
                 self.last_refresh_finished = stamp()
@@ -502,6 +568,111 @@ class Service:
             self.warm_idle()
         except Exception:
             pass  # warm-up is best effort; never breaks polling
+
+    def agy_refresh_stopped(self):
+        try:
+            found = self.agy_continue.stopped()
+            with self.lock:
+                self.agy_stopped = sorted(
+                    ({**f, 'project': os.path.basename((f.get('cwd') or '').rstrip('/')) or f['target']} for f in found),
+                    key=lambda f: -(f.get('at') or 0))
+                target = self.agy_target
+            if target and not self.agy_continue.alive(target):
+                with self.lock:
+                    if self.agy_target is target:
+                        self.agy_target = None
+                        self.save_targets()
+        except Exception:
+            pass  # only feeds the page's button
+
+    def save_targets(self):
+        try:
+            atomic_json(self.root / 'continue_targets.json', {'claude': self.claude_target, 'agy': self.agy_target})
+        except OSError:
+            pass
+
+    def continue_sessions(self, provider):
+        """What the dialog's picker offers: {'items': [{id, project, state, at}], 'default': id}. state: stopped (on
+        the usage limit), running (our continue is working on it), busy (working elsewhere: not offered for a Codex
+        thread, resuming it would make two writers), idle."""
+        items, default = [], None
+        if provider == 'codex':
+            with self.lock:
+                target = self.codex_current_target()
+                running = {w['thread'] for w in self.codex_watches if w['status'] == 'running'}
+            for t in sorted(self.watch_io.recent_threads(), key=lambda t: -(t.get('at') or 0)):
+                state = ('running' if t['thread'] in running else 'stopped' if t['last'] == 'task_failed'
+                         else 'error' if t['last'] == 'task_error'
+                         else 'busy' if t['last'] == 'task_started' else 'idle')
+                project = os.path.basename((t.get('cwd') or '').rstrip('/')) or t['thread'][-6:]
+                items.append({'id': t['thread'], 'state': state, 'at': t.get('at'), 'project': project,
+                              'name': t.get('name')})
+            default = target and target['thread']
+        elif provider == 'claude':
+            target = self.claude_current_target()
+            for record, hit, at in sorted(self.relinker.sessions(), key=lambda x: -(x[2] or 0)):
+                items.append({'id': record['sessionId'], 'at': at,
+                              'state': 'stopped' if hit else 'busy' if record.get('status') == 'busy'
+                              else 'error' if self.relinker.last_error(record['sessionId']) else 'idle',
+                              'project': record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))})
+            default = target and target[0]['sessionId']
+        elif provider == 'agy':
+            with self.lock:
+                target = self.agy_target
+            for sess in sorted(self.agy_continue.sessions(), key=lambda x: -(x.get('at') or 0)):
+                items.append({'id': f"{sess['kind']}:{sess['target']}", 'at': sess.get('at'),
+                              'state': 'stopped' if sess['stopped'] else 'idle',
+                              'project': os.path.basename((sess.get('cwd') or '').rstrip('/')) or sess['target']})
+            default = target and f"{target['kind']}:{target['target']}"
+        else:
+            raise QuotaError('INVALID_PARAMS')
+        ids = [i['id'] for i in items if not (provider == 'codex' and i['state'] == 'busy')]
+        if default not in ids:
+            default = next((i['id'] for i in items if i['state'] == 'stopped'), ids[0] if ids else None)
+        return {'items': items, 'default': default}
+
+    def agy_session(self, session_id):
+        kind, _, target = (session_id or '').partition(':')
+        sess = next((x for x in self.agy_continue.sessions() if x['kind'] == kind and x['target'] == target), None)
+        if not sess:
+            raise QuotaError('SESSION_GONE')
+        return {**{k: v for k, v in sess.items() if k != 'stopped'},
+                'project': os.path.basename((sess.get('cwd') or '').rstrip('/')) or sess['target']}
+
+    def agy_continue_now(self, text=None, session=None):
+        """The user asked (from the page) to type "continue" into the agy session that stopped on the limit last."""
+        text = continue_text(text)
+        with self.lock:
+            if self.switching or self.agy_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            if not self.active or gemini_spent(self.rows.get(self.active) or {}, 'gemini'):
+                raise QuotaError('ACTIVE_EXHAUSTED')
+            target = self.agy_session(session) if session else self.agy_target
+            if not target and not self.agy_stopped:
+                raise QuotaError('THREAD_NOT_STOPPED')
+            if target:  # the chosen session, or the one already being continued: keep talking to it
+                items, self.agy_continuing = [target], True
+            else:
+                items, self.agy_stopped, self.agy_continuing = self.agy_stopped[:1], self.agy_stopped[1:], True
+            active = self.active
+        threading.Thread(target=self._agy_continue_now, args=(items, active, text, bool(target)),
+                         daemon=True).start()
+        return self.status()
+
+    def _agy_continue_now(self, items, active, text, to_target=False):
+        try:
+            for item in items:
+                error = self.agy_continue.send(item, text, check=not to_target)
+                with self.lock:
+                    if error:
+                        self.event('agy_manualcontinue_failed', project=item['project'], error=error)
+                    else:
+                        self.agy_target = item
+                        self.save_targets()
+                        self.event('agy_manualcontinue', project=item['project'], selected=active)
+        finally:
+            with self.lock:
+                self.agy_continuing = False
 
     def _refresh_gemini(self):
         try:
@@ -556,6 +727,174 @@ class Service:
                 self.codex_state.update(profiles=data['profiles'], active=data['active'],
                                         updated_at=stamp(), error=None)
         self.codex_auto(time.time())
+        self.codex_refresh_stopped()
+
+    def codex_refresh_stopped(self):
+        """Threads stopped on the usage limit, offered on the page for a manual continue."""
+        try:
+            found = list(self.watch_io.stopped_threads())
+            with self.lock:
+                running = {w['thread'] for w in self.codex_watches if w['status'] == 'running'}
+                self.codex_state['stopped'] = sorted(
+                    ({**t, 'project': os.path.basename((t.get('cwd') or '').rstrip('/')) or t['thread'][-6:]}
+                     for t in found if t['thread'] not in running), key=lambda t: -(t.get('at') or 0))
+                self.codex_state['target'] = self.codex_current_target()
+        except Exception:
+            pass  # best effort; never breaks polling
+
+    def codex_current_target(self):
+        """The thread last continued (by ▶ or automatically), until it hits the usage limit again: ▶ keeps talking
+        to it instead of picking another stopped thread (2026-10-12)."""
+        last = self.codex_watches[-1] if self.codex_watches else None
+        if not last or last.get('status') == 'limited' or not last.get('started_at') \
+                or time.time() - timestamp(last['started_at']) > 24 * 3600:
+            return None
+        return {'thread': last['thread'], 'project': last['project'], 'running': last['status'] == 'running',
+                'tmux': last.get('tmux')}
+
+    def codex_thread_info(self, thread):
+        """(cwd, model) of a thread, from its rollout."""
+        try:
+            path = self.watch_io.rollout(thread)
+            with open(path) as f:
+                meta = json.loads(f.readline()).get('payload') or {}
+            return meta.get('cwd'), self.watch_io.thread_model(path)
+        except Exception:
+            return None, None
+
+    def codex_continue_now(self, thread, text=None):
+        """The user asked (from the page) to continue the thread that stopped on the limit last, on the live account."""
+        text = continue_text(text)
+        with self.lock:
+            target = self.codex_current_target()
+        if target and thread in (None, target['thread']):
+            return self.codex_send_to_target(target, text)
+        if thread is not None and not any(t['thread'] == thread for t in self.codex_state['stopped']):
+            return self.codex_send_to_thread(thread, text)  # picked in the dialog: any recent thread
+        with self.lock:
+            state = self.codex_state
+            items = [t for t in state['stopped'] if thread in (None, t['thread'])][:1]  # the latest one only
+            if not items:
+                raise QuotaError('THREAD_NOT_STOPPED')
+            if state['switching'] or self.codex_manual_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            active = state['active']
+            if not active or codex_exhausted(state['profiles'].get(active) or {}):
+                raise QuotaError('ACTIVE_EXHAUSTED')
+            ids = {t['thread'] for t in items}
+            state['stopped'] = [t for t in state['stopped'] if t['thread'] not in ids]  # the rest stay offered
+            if any(w['thread'] in ids for w in self.codex_waiting):
+                self.codex_waiting = [w for w in self.codex_waiting if w['thread'] not in ids]
+                self.save_waiting()
+            self.codex_manual_continuing = True
+        threading.Thread(target=self._codex_continue_now, args=(items, active, text), daemon=True).start()
+        return self.status()
+
+    def codex_send_to_thread(self, thread, text):
+        """Resume a thread picked in the dialog with the text, unless it is working elsewhere right now."""
+        found = next((t for t in self.watch_io.recent_threads() if t['thread'] == thread), None)
+        if not found:
+            raise QuotaError('SESSION_GONE')
+        if found['last'] == 'task_started':
+            raise QuotaError('THREAD_BUSY')  # ChatGPT or another CLI is working on it: two writers otherwise
+        cwd, model = self.codex_thread_info(thread)
+        with self.lock:
+            state = self.codex_state
+            if state['switching'] or self.codex_manual_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            active = state['active']
+            if not active or codex_exhausted(state['profiles'].get(active) or {}):
+                raise QuotaError('ACTIVE_EXHAUSTED')
+            self.codex_manual_continuing = True
+        threading.Thread(target=self._codex_continue_now, args=([{'thread': thread, 'cwd': cwd, 'model': model}],
+                                                                active, text), daemon=True).start()
+        return self.status()
+
+    def continue_preview(self, provider, session=None):
+        """The conversation ▶ would send to and its latest output (read only), for the dialog."""
+        limit = 20000  # characters shown: the end of a very long answer
+        if session:
+            if provider == 'codex':
+                cwd, _ = self.codex_thread_info(session)
+                text, at = self.watch_io.last_output(session)
+                project = os.path.basename((cwd or '').rstrip('/')) or session[-6:]
+            elif provider == 'claude':
+                found = self.relinker.session(session)
+                if not found:
+                    raise QuotaError('SESSION_GONE')
+                record = found[0]
+                text, at = self.relinker.last_output(record)
+                project = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+            elif provider == 'agy':
+                pick = self.agy_session(session)
+                text, at, project = self.agy_continue.last_output(pick), None, pick['project']
+            else:
+                raise QuotaError('INVALID_PARAMS')
+            cut = bool(text) and len(text) > limit
+            return {'project': project, 'text': text[-limit:] if text else None, 'at': at, 'cut': cut, 'target': True}
+        if provider == 'codex':
+            with self.lock:
+                target = self.codex_current_target()
+                stopped = list(self.codex_state['stopped'])
+            pick = target or (stopped[0] if stopped else None)
+            if not pick:
+                return None
+            text, at = self.watch_io.last_output(pick['thread'])
+            project = pick['project']
+        elif provider == 'claude':
+            target = self.claude_current_target()
+            if target:
+                record, project = target
+            else:
+                stopped = self.claude_latest_first(self.relinker.stopped_sessions())
+                if not stopped:
+                    return None
+                record = stopped[0][1][0]
+                project = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+            text, at = self.relinker.last_output(record)
+        elif provider == 'agy':
+            with self.lock:
+                target = self.agy_target
+                pick = target or (self.agy_stopped[0] if self.agy_stopped else None)
+            if not pick:
+                return None
+            text, at, project = self.agy_continue.last_output(pick), None, pick['project']
+        else:
+            raise QuotaError('INVALID_PARAMS')
+        cut = bool(text) and len(text) > limit
+        return {'project': project, 'text': text[-limit:] if text else None, 'at': at, 'cut': cut,
+                'target': bool(target)}
+
+    def codex_send_to_target(self, target, text):
+        with self.lock:
+            state = self.codex_state
+            if state['switching'] or self.codex_manual_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            active = state['active']
+            if not active or codex_exhausted(state['profiles'].get(active) or {}):
+                raise QuotaError('ACTIVE_EXHAUSTED')
+            if not target['running']:
+                self.codex_manual_continuing = True
+        if target['running']:  # its CLI is still working: the prompt is queued there
+            try:
+                self.watch_io.type(target['tmux'], text)
+            except Exception:
+                raise QuotaError('TYPE_FAILED') from None
+            with self.lock:
+                self.event('codex_manualcontinue', project=target['project'], selected=active, queued=True)
+            return self.status()
+        cwd, model = self.codex_thread_info(target['thread'])
+        item = {'thread': target['thread'], 'cwd': cwd, 'model': model}
+        threading.Thread(target=self._codex_continue_now, args=([item], active, text), daemon=True).start()
+        return self.status()
+
+    def _codex_continue_now(self, items, active, text):
+        try:
+            self.codex_continue([{k: t.get(k) for k in ('thread', 'cwd', 'model')} for t in items], active,
+                                kind='codex_manualcontinue', text=text)
+        finally:
+            with self.lock:
+                self.codex_manual_continuing = False
 
     def refresh_claude(self, now=None, force=False):
         now = time.time() if now is None else now
@@ -596,6 +935,20 @@ class Service:
                 if self.claude_good >= 10 and interval > base:
                     self.claude_interval, self.claude_good = max(base, interval // 2), 0
             self.claude_next_poll = now + max(self.claude_interval, base)
+        try:
+            stopped = self.claude_latest_first(self.relinker.stopped_sessions())
+            target = self.claude_current_target()
+            with self.lock:
+                self.claude_state['stopped'] = [r.get('name') or os.path.basename((r.get('cwd') or '').rstrip('/'))
+                                                for _, (r, _) in stopped]
+                self.claude_state['target'] = target and {'sessionId': target[0]['sessionId'], 'project': target[1]}
+        except Exception:
+            pass  # only feeds the page's "送 continue" button
+        try:
+            self.claude_auto(now)
+        except Exception:
+            with self.lock:
+                self.claude_continuing = False  # best effort; never breaks polling
 
     def claude_use(self, params, source='manual'):
         label = params.get('label')
@@ -617,6 +970,10 @@ class Service:
                 for name, r in self.claude_state['profiles'].items():
                     r['active'] = name == result['selected']
                 self.event('claude_switched', selected=result['selected'], source=source)
+            if source == 'manual':
+                self.claude_hand_over()
+            with self.lock:
+                self.claude_relinking = True  # set here so no poll can type "continue" before the relink starts
             threading.Thread(target=self.claude_relink, args=(remote_before,), daemon=True).start()
             return result
         except QuotaError as e:
@@ -642,33 +999,327 @@ class Service:
                                       f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
                 else:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
+        started = time.time()
         try:
             self.relinker.run(report, before)
         except Exception:
             with self.lock:
                 self.event('claude_remote_failed', project='', error='RELINK_ERROR')
+        finally:
+            try:  # sessions pick up the new login before anything is typed into them ("continue" included)
+                left = PICKUP - (time.time() - started)
+                if left > 0:
+                    self.relinker.io.sleep(left)
+            finally:
+                with self.lock:
+                    self.claude_relinking = False
+
+    def claude_auto(self, now):
+        """Claude Code sessions stopped on the usage limit get "continue" once the live account has quota again (its
+        window refilled; a switch by hand hands what stopped over to the user, see claude_hand_over). Claude never switches by itself: until then
+        it waits (claude_waiting_quota) and checks again every poll."""
+        with self.lock:
+            state = self.claude_state
+            if not state['waitcontinue']:
+                return
+        self.claude_check_replies(now)
+        with self.lock:
+            if state['switching'] or self.claude_relinking or self.claude_continuing or not state['active']:
+                return
+            active, row = state['active'], copy.deepcopy(state['profiles'].get(state['active']) or {})
+        if row.get('stale') or row.get('status') != 'OK':
+            return  # rate-limited / failed poll: old numbers decide nothing
+        try:
+            stopped = self.relinker.stopped_sessions()
+        except Exception:
+            return
+        with self.lock:
+            ids = {r['sessionId'] for r, _ in stopped.values()}
+            self.claude_continued = {k: v for k, v in self.claude_continued.items()
+                                     if k in ids or v.get('pending')}  # got past it (and its answer was seen)
+            due = {pid: (r, uuid) for pid, (r, uuid) in stopped.items() if self.claude_due(r['sessionId'], uuid, now)}
+            if not due:
+                return
+            if not codex_available(row):
+                if not self.claude_waiting:
+                    self.claude_waiting = True
+                    self.event('claude_waiting_quota', selected=active, count=len(due))
+                return
+            self.claude_waiting = False
+            self.claude_continuing = True
+        threading.Thread(target=self.claude_continue, args=(due, active), daemon=True).start()
+
+    def claude_check_replies(self, now):
+        """Typing "continue" is not continuing: only a new answer from the session counts (claude_continue_done);
+        the usage limit again, or no answer at all, is reported."""
+        with self.lock:
+            pending = {k: dict(v) for k, v in self.claude_continued.items() if v.get('pending')}
+        for sid, v in pending.items():
+            try:
+                uuid, hit = self.relinker.last_reply(sid)
+            except Exception:
+                continue
+            if uuid and uuid != v['uuid']:
+                error = None if hit else self.relinker.last_error(sid)
+                kind = 'claude_continue_limited' if hit else 'claude_continue_error' if error and error['uuid'] == uuid \
+                    else 'claude_continue_done'
+            elif now - v['at'] > CLAUDE_REPLY_WAIT:
+                kind = 'claude_continue_noreply'
+            else:
+                continue
+            with self.lock:
+                if sid in self.claude_continued:
+                    self.claude_continued[sid]['pending'] = False
+                if kind == 'claude_continue_error':
+                    self.session_errors[f"claude:{sid}:{uuid}"] = time.time()
+                    self.save_session_errors()
+                self.event(kind, project=v.get('project', ''),
+                           **({'error': error['text'][:200]} if kind == 'claude_continue_error' else {}))
+                if kind != 'claude_continue_done' and self.config['notify']:
+                    self.notifier(f"Claude 喺 {v.get('project', '')} 打咗 continue，但" +
+                                  ('又撞到用量上限。' if kind == 'claude_continue_limited' else
+                                   f"出錯停咗：{error['text'][:120]}" if kind == 'claude_continue_error' else
+                                   '30 分鐘都冇回應：請自己睇睇。'))
+
+    def check_session_errors(self, now, window=3600):
+        """Codex threads and Claude sessions that stopped on an error other than the usage limit (the model at
+        capacity, a login that expired, ...) look finished from outside; each such stop is reported once
+        (codex_session_error / claude_session_error, with a notification). Only stops of the last hour: an old one
+        found after a restart is not news."""
+        found = []
+        for t in self.watch_io.recent_threads(max_age=window):
+            if t['last'] == 'task_error' and now - (t.get('at') or 0) <= window:
+                project = os.path.basename((t.get('cwd') or '').rstrip('/')) or t['thread'][-6:]
+                found.append((f"codex:{t['thread']}:{t['at']}", 'codex_session_error', 'Codex',
+                              t.get('name') or project, project, t.get('error') or ''))
+        for record, _, _ in self.relinker.sessions():
+            error = self.relinker.last_error(record['sessionId'])
+            if not error:
+                continue
+            try:
+                at = timestamp_of(error['timestamp'])
+            except (TypeError, ValueError):
+                continue
+            if now - at <= window:
+                project = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+                found.append((f"claude:{record['sessionId']}:{error['uuid']}", 'claude_session_error', 'Claude',
+                              project, project, error['text'] or error.get('error') or ''))
+        with self.lock:
+            new = [f for f in found if f[0] not in self.session_errors]
+            for key, kind, name, label, project, text in new:
+                self.session_errors[key] = now
+                self.event(kind, project=label, error=text[:200])
+                if self.config['notify']:
+                    self.notifier(f"{name} 喺 {label} 出錯停咗：{text[:120] or '未知錯誤'}。工作未完成，要接續請撳 ▶。")
+            if new or any(now - v > 2 * 86400 for v in self.session_errors.values()):
+                self.session_errors = {k: v for k, v in self.session_errors.items() if now - v <= 2 * 86400}
+                self.save_session_errors()
+
+    def save_session_errors(self):
+        try:
+            atomic_json(self.root / 'session_errors.json', self.session_errors)
+        except OSError:
+            pass
+
+    def claude_due(self, session_id, uuid, now):
+        seen = self.claude_continued.get(session_id)
+        if not seen:
+            return True
+        if seen['uuid'] == uuid:
+            return False  # already continued this stop (it may still be on its way)
+        return seen['tries'] < CLAUDE_CONTINUE_TRIES and now - seen['at'] >= CLAUDE_CONTINUE_GAP
+
+    def claude_hand_over(self):
+        """A switch by hand: the sessions stopped on the limit now are the user's, never continued automatically
+        (only a later stop, or the page's ▶, types into them)."""
+        try:
+            stopped = self.relinker.stopped_sessions()
+        except Exception:
+            return
+        with self.lock:
+            for record, uuid in stopped.values():
+                self.claude_continued[record['sessionId']] = {'uuid': uuid, 'tries': 0, 'at': time.time(),
+                                                              'project': record.get('name') or '', 'pending': False}
+            self.claude_waiting = False
+            if stopped:
+                self.event('claude_waiting_cleared', count=len(stopped))
+
+    def claude_current_target(self):
+        """(record, name) of the session last continued, until it hits the usage limit again: ▶ keeps talking to it."""
+        with self.lock:
+            target = self.claude_target
+        if not target:
+            return None
+        try:
+            found = self.relinker.session(target['sessionId'])
+            found = found if isinstance(found, tuple) and len(found) == 2 else None
+        except Exception:
+            found = None
+        if not found or (found[1] and time.time() - target['at'] > 60):  # ended, or stopped on the limit again
+            with self.lock:
+                if self.claude_target is target:
+                    self.claude_target = None
+                    self.save_targets()
+            return None
+        record = found[0]
+        return record, record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+
+    def claude_latest_first(self, stopped):
+        """[(pid, (record, uuid))], the session that stopped last first."""
+        def at(record):
+            try:
+                value = self.relinker.stopped_at(record)
+                return value if isinstance(value, (int, float)) else 0
+            except Exception:
+                return 0
+        return sorted(stopped.items(), key=lambda kv: -at(kv[1][0]))
+
+    def claude_continue_now(self, text=None, session=None):
+        """The user asked (from the page) to type "continue" into the session that stopped on the limit last."""
+        text = continue_text(text)
+        with self.lock:
+            state = self.claude_state
+            if state['switching'] or self.claude_relinking or self.claude_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            active = state['active']
+            if not active or not codex_available(state['profiles'].get(active) or {}):
+                raise QuotaError('ACTIVE_EXHAUSTED')
+        if session:
+            found = self.relinker.session(session)
+            if not found:
+                raise QuotaError('SESSION_GONE')
+            record = found[0]
+            target = record, record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+        else:
+            target = self.claude_current_target()
+        if target:
+            with self.lock:
+                self.claude_continuing = True
+            threading.Thread(target=self.claude_send_to_target, args=(target, active, text), daemon=True).start()
+            return self.status()
+        stopped = dict(self.claude_latest_first(self.relinker.stopped_sessions())[:1])  # the latest one only
+        if not stopped:
+            raise QuotaError('THREAD_NOT_STOPPED')
+        with self.lock:
+            if self.claude_continuing:
+                raise QuotaError('SWITCH_BUSY')
+            self.claude_continuing = True
+            self.claude_state['stopped'] = []
+        threading.Thread(target=self.claude_continue, args=(stopped, active, 'claude_manualcontinue', text),
+                         daemon=True).start()
+        return self.status()
+
+    def claude_send_to_target(self, target, selected, text):
+        record, name = target
+        try:
+            try:
+                reply, _ = self.relinker.last_reply(record['sessionId'])
+            except Exception:
+                reply = None
+            error = self.relinker.resume(record, text)
+            with self.lock:
+                if error:
+                    self.event('claude_autocontinue_failed', project=name, error=error)
+                else:
+                    self.claude_continued[record['sessionId']] = {'uuid': reply, 'tries': 0, 'at': time.time(),
+                                                                  'project': name, 'pending': True}
+                    self.claude_target = {'sessionId': record['sessionId'], 'at': time.time()}
+                    self.save_targets()
+                    self.event('claude_manualcontinue', project=name, selected=selected)
+        except Exception:
+            with self.lock:
+                self.event('claude_autocontinue_failed', project=name, error='CONTINUE_ERROR')
+        finally:
+            with self.lock:
+                self.claude_continuing = False
+
+    def claude_continue(self, due, selected, kind='claude_autocontinue', text='continue'):
+        try:
+            still = self.relinker.stopped_sessions()
+            for pid, (record, uuid) in due.items():
+                if pid not in still or still[pid][1] != uuid:
+                    continue  # it moved on meanwhile (continued by hand, or ended)
+                name = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
+                error = self.relinker.resume(record) if text == 'continue' else self.relinker.resume(record, text)
+                with self.lock:
+                    seen = self.claude_continued.get(record['sessionId'], {'tries': 0})
+                    self.claude_continued[record['sessionId']] = {'uuid': uuid, 'tries': seen['tries'] + 1,
+                                                                  'at': time.time(), 'project': name,
+                                                                  'pending': not error}
+                    if error:
+                        self.event('claude_autocontinue_failed', project=name, error=error)
+                        if self.config['notify']:
+                            self.notifier(f"Claude 有額度返，但未能喺 {name} 自動打 continue（{error}）：請自己接續")
+                    else:
+                        self.claude_target = {'sessionId': record['sessionId'], 'at': time.time()}
+                        self.save_targets()
+                        self.event(kind, project=name, selected=selected)
+        except Exception:
+            with self.lock:
+                self.event('claude_autocontinue_failed', project='', error='CONTINUE_ERROR')
+        finally:
+            with self.lock:
+                self.claude_continuing = False
+
+    def claude_waitcontinue_set(self, value):
+        if type(value) is not bool:
+            raise QuotaError('INVALID_ENABLED')
+        with self.lock:
+            self.claude_state['waitcontinue'] = value
+            atomic_json(self.root / 'claude.json', {'waitcontinue': value})
+            self.claude_waiting = False
+            self.event('claude_waitcontinue_changed', enabled=value)
+            return self.status()
 
     def codex_auto(self, now):
-        """Switch only when the live Codex account is used up and another one still has capacity."""
+        """Switch only when the live Codex account is used up and another one still has capacity (auto); continue what
+        stopped once the live account has quota again (waitcontinue) - each setting works without the other."""
         with self.lock:
             state = self.codex_state
-            if not state['auto'] or state['switching'] or now - self.last_codex_switch < CODEX_COOLDOWN:
+            if (not (state['auto'] or state['waitcontinue']) or state['switching'] or self.codex_manual_continuing
+                    or now - self.last_codex_switch < CODEX_COOLDOWN):
                 return
             active, rows = state['active'], state['profiles']
-            if not active or not codex_exhausted(rows.get(active, {})):
+            refilled, waiting, candidates, capture = not active or not codex_exhausted(rows.get(active, {})), [], [], False
+            if refilled:
                 self.codex_all_exhausted = False
-                return
-            refill = reset_epoch((rows[active].get('5h') or {}).get('reset_at'))
-            if refill and 0 < refill - now <= STAY_WINDOW:
-                return  # live account refills within 15 min: do not close ChatGPT / Codex for that
-            candidates = codex_order(rows, active, now, self.config['remaining_below'])
-            if not candidates:
-                if not self.codex_all_exhausted:
+                if state['waitcontinue'] and active and rows.get(active, {}).get('status') == 'OK' and self.codex_waiting:
+                    waiting, self.codex_waiting = self.codex_waiting, []
+                    self.save_waiting()
+            else:
+                refill = reset_epoch((rows[active].get('5h') or {}).get('reset_at'))
+                if state['auto'] and refill and 0 < refill - now <= STAY_WINDOW:
+                    return  # live account refills within 15 min: do not close ChatGPT / Codex for that
+                candidates = codex_order(rows, active, now, self.config['remaining_below']) if state['auto'] else []
+                if not candidates and not self.codex_all_exhausted:
                     self.codex_all_exhausted = True
-                    self.event('codex_all_exhausted')
-                return
+                    self.event('codex_all_exhausted' if state['auto'] else 'codex_waiting_quota')
+                    capture = state['waitcontinue']
+        if refilled:
+            if waiting:  # the live account refilled: continue what stopped while everything was used up
+                self.codex_continue(waiting, active)
+            return
+        if not candidates:
+            if capture:  # note what just stopped (it only looks interrupted for a few minutes)
+                try:
+                    found = self.watch_io.interrupted_threads()
+                except Exception:
+                    found = []
+                with self.lock:
+                    known = {w['thread'] for w in self.codex_waiting}
+                    for item in found:
+                        if item['thread'] not in known:
+                            try:
+                                path = self.watch_io.rollout(item['thread'])
+                                size = self.watch_io.size(path) if path else None
+                            except OSError:
+                                size = None
+                            self.codex_waiting.append({**item, 'size': size})
+                    self.save_waiting()
+            return
+        with self.lock:
             target = candidates[0]
-            autocontinue = state['autocontinue']
+            autocontinue, waitcontinue = state['autocontinue'], state['waitcontinue']
         # Capture interrupted threads before the switch closes ChatGPT / Codex CLI.
         try:
             app_was_running = self.codex.app_running()
@@ -680,6 +1331,11 @@ class Service:
                 captured = self.watch_io.interrupted_threads()
             except Exception:
                 captured = []
+        if waitcontinue:  # an account got quota back after all were used up: what stopped then goes on too
+            with self.lock:
+                waiting, self.codex_waiting = self.still_stopped(self.codex_waiting), []
+                self.save_waiting()
+            captured += [w for w in waiting if w['thread'] not in {c['thread'] for c in captured}]
         try:
             self.codex_use({'label': target}, source='automatic')
         except QuotaError:
@@ -689,7 +1345,51 @@ class Service:
             try:
                 self.codex.continue_thread(item['thread'], item.get('model'))
                 with self.lock:
-                    self.event('codex_autocontinue', project=project, selected=target)
+                    self.autocontinue_event(project, target)
+            except QuotaError as e:
+                with self.lock:
+                    self.event('codex_autocontinue_failed', project=project, error=str(e))
+        self.codex_app_safety_net(app_was_running)
+
+    def still_stopped(self, items):
+        """Waiting threads nobody continued meanwhile: no new turn since they were noted, or only one that ended on the
+        usage limit again. Not the file size: ChatGPT writes thread_settings_applied when it opens the thread
+        (2026-10-12 11:12 that dropped the waiting thread without a continue)."""
+        out = []
+        for w in items:
+            try:
+                path = self.watch_io.rollout(w['thread'])
+                if path and (w.get('size') is None or self.watch_io.turn(path, w['size'])[0] in (None, 'task_failed')):
+                    out.append(w)
+                elif path:
+                    with self.lock:
+                        self.event('codex_waiting_dropped', project=os.path.basename((w.get('cwd') or '').rstrip('/')))
+            except OSError:
+                continue
+        return out
+
+    def save_waiting(self):
+        try:
+            atomic_json(self.root / 'codex_waiting.json', self.codex_waiting)
+        except OSError:
+            pass
+
+    def codex_continue(self, waiting, selected, kind='codex_autocontinue', text='continue'):
+        """The live Codex account has quota again: continue the threads that stopped while all were used up."""
+        items = self.still_stopped(waiting)
+        if not items:
+            return
+        try:
+            app_was_running = self.codex.app_running()
+        except Exception:
+            app_was_running = False
+        for item in items:
+            project = os.path.basename((item.get('cwd') or '').rstrip('/')) or item['thread'][-6:]
+            try:
+                extra = {'prompt': text} if text != 'continue' else {}
+                self.codex.continue_thread(item['thread'], item.get('model'), **extra)
+                with self.lock:
+                    self.autocontinue_event(project, selected, kind)
             except QuotaError as e:
                 with self.lock:
                     self.event('codex_autocontinue_failed', project=project, error=str(e))
@@ -920,28 +1620,58 @@ class Service:
             path = io.rollout(w['thread'])
             last, message = io.turn(path, w.get('offset', 0)) if path else (None, None)
             alive = io.cli_alive(w['thread'])
-            if alive and (last != 'task_complete' or io.cli_busy(w['tmux'])):
+            if alive and (last not in ('task_complete', 'task_failed', 'task_error') or io.cli_busy(w['tmux'])):
                 continue
             if alive:
                 io.release(w['tmux'])
-            done = last == 'task_complete'
+            done = last == 'task_complete' and bool(message)  # only an answer counts as continued
+            failed = last == 'task_error'  # stopped on an error that is not the usage limit (model at capacity, ...)
+            limited = not done and last in ('task_complete', 'task_failed')  # ended without an answer
+            error = io.turn_error(path) if failed else None
             summary = next((line.strip() for line in (message or '').splitlines() if line.strip()), None)
             with self.lock:
-                w.update(status='done' if done else 'interrupted', finished_at=stamp(),
-                         summary=summary[:160] if summary else None, released=not io.cli_alive(w['thread']))
+                if failed:  # reported here; the error scan must not report the same stop again
+                    self.session_errors[f"codex:{w['thread']}:{io.stopped_at(path)}"] = time.time()
+                    self.save_session_errors()
+                w.update(status='done' if done else 'error' if failed else 'limited' if limited else 'interrupted',
+                         finished_at=stamp(), summary=summary[:160] if summary else None,
+                         released=not io.cli_alive(w['thread']))
                 self.save_watches()
-                self.event('codex_continue_done' if done else 'codex_continue_interrupted',
-                           project=w['project'], summary=w['summary'])
+                self.event('codex_continue_done' if done else 'codex_continue_error' if failed
+                           else 'codex_continue_limited' if limited else 'codex_continue_interrupted',
+                           project=w['project'], summary=w['summary'], **({'error': error} if failed else {}))
                 if self.config['notify']:
                     self.notifier(f"Codex 接續完成：{w['project']}。已釋放對話，可以喺 app 撳重試。" if done else
+                                  f"Codex 接續出錯停咗：{w['project']}（{error or '未知錯誤'}），工作未完成。" if failed else
+                                  f"Codex 接續冇回應：{w['project']}（多數係撞到額度上限），工作未完成。" if limited else
                                   f"Codex 接續中斷：{w['project']}（CLI 已結束，工作未完成）。")
+
+    def save_codex_settings(self):
+        atomic_json(self.root / 'codex.json', {k: self.codex_state[k] for k in ('auto', 'autocontinue', 'waitcontinue')})
+
+    def codex_waitcontinue_set(self, value):
+        if type(value) is not bool:
+            raise QuotaError('INVALID_ENABLED')
+        with self.lock:
+            self.codex_state['waitcontinue'] = value
+            if not value:
+                self.codex_waiting = []
+                self.save_waiting()
+            self.save_codex_settings()
+            self.codex_all_exhausted = False
+            self.event('codex_waitcontinue_changed', enabled=value)
+            return self.status()
 
     def codex_autocontinue_set(self, value):
         if type(value) is not bool:
             raise QuotaError('INVALID_ENABLED')
         with self.lock:
             self.codex_state['autocontinue'] = value
-            atomic_json(self.root / 'codex.json', {'auto': self.codex_state['auto'], 'autocontinue': value})
+            if value and not self.codex_state['auto']:  # it only ever runs after an automatic switch
+                self.codex_state['auto'] = True
+                self.codex_all_exhausted = False
+                self.event('codex_auto_changed', enabled=True)
+            self.save_codex_settings()
             self.event('codex_autocontinue_changed', enabled=value)
             return self.status()
 
@@ -1077,7 +1807,7 @@ class Service:
             raise QuotaError('INVALID_ENABLED')
         with self.lock:
             self.codex_state['auto'] = value
-            atomic_json(self.root / 'codex.json', {'auto': value, 'autocontinue': self.codex_state['autocontinue']})
+            self.save_codex_settings()
             self.codex_all_exhausted = False
             self.event('codex_auto_changed', enabled=value)
             return self.status()
@@ -1099,6 +1829,10 @@ class Service:
                 for name, r in self.codex_state['profiles'].items():
                     r['active'] = name == result['selected']
                 self.event('codex_switched', selected=result['selected'], source=source)
+                if source == 'manual' and self.codex_waiting:  # the user took over: nothing automatic follows
+                    self.event('codex_waiting_cleared', count=len(self.codex_waiting))
+                    self.codex_waiting = []
+                    self.save_waiting()
             return result
         except QuotaError as e:
             with self.lock:
@@ -1119,7 +1853,20 @@ class Service:
             self.refresh(scope)
             with self.lock:
                 delay = max(1, self.config['poll_seconds'] - (time.monotonic() - started))
-            self.refresh_requested.wait(delay)
+                refill = self.codex_refill_in(time.time())
+                early = refill is not None and refill < delay  # threads wait for it: look right after it resets
+            if not self.refresh_requested.wait(refill if early else delay) and early:
+                self.refresh_scope = 'codex'
+
+    def codex_refill_in(self, now, settle=10):
+        """Seconds until just after the live Codex account's 5 h window resets, while threads wait for quota."""
+        if not (self.codex_waiting and self.codex_state['waitcontinue']):
+            return None
+        row = self.codex_state['profiles'].get(self.codex_state['active']) or {}
+        reset = reset_epoch((row.get('5h') or {}).get('reset_at'))
+        if not reset or not codex_exhausted(row) or reset + settle <= now:
+            return None  # past it already: the normal poll keeps looking
+        return reset + settle - now
 
     def decide(self, now):
         """Pure selection under lock; only fresh complete family windows qualify."""
@@ -1433,6 +2180,20 @@ class Service:
             return self.account_remove(params)
         if method == 'codex.watch.add':
             return self.codex_watch_add(params)
+        if method == 'claude.waitcontinue.set':
+            return self.claude_waitcontinue_set(params.get('enabled'))
+        if method == 'continue.preview':
+            return self.continue_preview(params.get('provider'), params.get('session'))
+        if method == 'continue.sessions':
+            return self.continue_sessions(params.get('provider'))
+        if method == 'agy.continue.now':
+            return self.agy_continue_now(params.get('text'), params.get('session'))
+        if method == 'claude.continue.now':
+            return self.claude_continue_now(params.get('text'), params.get('session'))
+        if method == 'codex.continue.now':
+            return self.codex_continue_now(params.get('session') or params.get('thread'), params.get('text'))
+        if method == 'codex.waitcontinue.set':
+            return self.codex_waitcontinue_set(params.get('enabled'))
         if method == 'codex.autocontinue.set':
             return self.codex_autocontinue_set(params.get('enabled'))
         if method == 'codex.auto.set':
@@ -1503,7 +2264,7 @@ def rpc(root, method, params=None):
         sock.settimeout(90)
         sock.connect(str(Path(root) / 'rotatord.sock'))
         sock.sendall(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method,
-                                 'params': params or {}}).encode() + b'\n')
+                                 'params': params or {}}, ensure_ascii=False).encode() + b'\n')  # CJK: 3 bytes, not 6
         with sock.makefile('rb') as f:
             result = json.loads(f.readline(1024 * 1024))
         if 'error' in result:

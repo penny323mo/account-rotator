@@ -32,7 +32,19 @@ LIMIT = 1800         # give up on sessions still busy after 30 minutes
 POLL = 10
 MENU = 'Disconnect this session'
 SELECTED_DISCONNECT = re.compile(r'❯\s*Disconnect this session')
+EMPTY_PROMPT = re.compile(r'^\s*❯[\s\u00a0]*$', re.M)  # the input line with nothing typed (a menu row has text)
+PROJECTS = os.path.expanduser('~/.claude/projects')
+DIM = re.compile(r'\x1b\[2m.*?(?:\x1b\[(?:0|22)?m|$)', re.M)
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 KEYS = {'up': 'Up', 'enter': 'Enter', 'esc': 'Escape'}
+
+
+def prompt_typed(content):
+    """A user entry that is a prompt someone typed, not a tool result handed back to the model."""
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and any(isinstance(c, dict) and c.get('type') == 'text' for c in content) \
+        and not any(isinstance(c, dict) and c.get('type') == 'tool_result' for c in content)
 
 
 class SystemIO:
@@ -64,6 +76,99 @@ class SystemIO:
         return subprocess.run([TMUX, 'capture-pane', '-p', '-t', pane], capture_output=True, text=True,
                               timeout=10, check=True).stdout
 
+    def last_message(self, session_id):
+        """(uuid, hit_limit) of the transcript's last user / assistant entry; hit_limit = Claude's own usage-limit
+        error ("You've hit your session limit · resets ..."), which is how a stopped session looks on disk."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        if not paths:
+            return None, False
+        with open(paths[0], 'rb') as f:
+            f.seek(max(0, os.path.getsize(paths[0]) - 512 * 1024))
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get('type') in ('user', 'assistant'):
+                return d.get('uuid'), bool(d.get('isApiErrorMessage')) and d.get('error') == 'rate_limit'
+        return None, False
+
+    def last_reply(self, session_id):
+        """(uuid, hit_limit) of the transcript's last assistant entry: after "continue" was typed, a new one is the
+        session's answer (or the usage limit again)."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        if not paths:
+            return None, False
+        with open(paths[0], 'rb') as f:
+            f.seek(max(0, os.path.getsize(paths[0]) - 512 * 1024))
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get('type') == 'assistant':
+                return d.get('uuid'), bool(d.get('isApiErrorMessage')) and d.get('error') == 'rate_limit'
+        return None, False
+
+    def last_error(self, session_id):
+        """{uuid, error, text, timestamp} when the transcript's last assistant entry is an API error other than the
+        usage limit (model overloaded, login expired, ...): the session stopped and waits for someone; else None."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        if not paths:
+            return None
+        with open(paths[0], 'rb') as f:
+            f.seek(max(0, os.path.getsize(paths[0]) - 512 * 1024))
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get('type') == 'user' and not d.get('isMeta'):
+                return None  # someone typed after it (or a tool ran): it moved on
+            if d.get('type') != 'assistant':
+                continue
+            if not d.get('isApiErrorMessage') or d.get('error') == 'rate_limit':
+                return None
+            text = ' '.join(c.get('text') or '' for c in (d.get('message') or {}).get('content') or []
+                            if isinstance(c, dict)).strip()
+            return {'uuid': d.get('uuid'), 'error': d.get('error'), 'text': text, 'timestamp': d.get('timestamp')}
+        return None
+
+    def last_output(self, session_id, tail=4 * 1024 * 1024):
+        """(text, timestamp) of the session's last round: every assistant text since the last prompt the user typed
+        (tool results do not count), oldest first, without the usage-limit error. A round without any text gives the
+        one before it. (None, None) when there is none."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        if not paths:
+            return None, None
+        with open(paths[0], 'rb') as f:
+            f.seek(max(0, os.path.getsize(paths[0]) - tail))
+            lines = f.read().splitlines()
+        texts, at = [], None
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            content = (d.get('message') or {}).get('content')
+            if d.get('type') == 'user' and texts and not d.get('isMeta') and prompt_typed(content):
+                break
+            if d.get('type') != 'assistant' or d.get('isApiErrorMessage') or not isinstance(content, list):
+                continue
+            text = '\n'.join(c.get('text') or '' for c in content if isinstance(c, dict) and c.get('type') == 'text').strip()
+            if text:
+                texts.append(text)
+                at = at or d.get('timestamp')
+        return ('\n\n'.join(reversed(texts)), at) if texts else (None, None)
+
+    def stopped_at(self, session_id):
+        """When the transcript was last written (the session that stopped last is the one the page offers)."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        return os.path.getmtime(paths[0]) if paths else 0
+
     def owned(self, link):
         """True when the live login can see this Remote Control link, False when it cannot, None when unknown."""
         try:
@@ -79,6 +184,12 @@ class SystemIO:
             return False if e.code == 404 else None
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             return None
+
+    def typed_screen(self, pane):
+        """The tmux pane's screen without dim text: Claude's greyed-out prompt suggestion is not something typed."""
+        out = subprocess.run([TMUX, 'capture-pane', '-p', '-e', '-t', pane], capture_output=True, text=True,
+                             timeout=10, check=True).stdout
+        return ANSI.sub('', DIM.sub('', out))
 
     def sleep(self, seconds):
         time.sleep(seconds)
@@ -135,6 +246,65 @@ class Relinker:
         self.io.sleep(8)
         if MENU in self.bottom(where):  # connected already (nothing to disconnect after all): just close the menu
             self.send(where, 'esc')
+        return None
+
+    def stopped_sessions(self):
+        """Idle running sessions whose last message is the usage-limit error: {pid: (record, error uuid)}."""
+        out = {}
+        for r in self.io.records():
+            if r.get('status') != 'idle' or not r.get('sessionId') or not isinstance(r.get('pid'), int):
+                continue
+            try:
+                uuid, hit = self.io.last_message(r['sessionId'])
+            except (OSError, ValueError):
+                continue
+            if hit and self.io.alive(r['pid']):
+                out[r['pid']] = (r, uuid)
+        return out
+
+    def last_reply(self, session_id):
+        return self.io.last_reply(session_id)
+
+    def last_error(self, session_id):
+        return self.io.last_error(session_id)
+
+    def sessions(self):
+        """[(record, hit_limit, last written)] for every running session (the page's session picker)."""
+        out = []
+        for r in self.io.records():
+            if r.get('sessionId') and isinstance(r.get('pid'), int) and self.io.alive(r['pid']):
+                try:
+                    out.append((r, self.io.last_message(r['sessionId'])[1], self.io.stopped_at(r['sessionId'])))
+                except (OSError, ValueError):
+                    continue
+        return out
+
+    def session(self, session_id):
+        """(record, hit_limit) of the running session with this id, or None when it ended."""
+        for r in self.io.records():
+            if r.get('sessionId') == session_id and isinstance(r.get('pid'), int) and self.io.alive(r['pid']):
+                return r, self.io.last_message(session_id)[1]
+        return None
+
+    def stopped_at(self, record):
+        return self.io.stopped_at(record['sessionId'])
+
+    def last_output(self, record):
+        return self.io.last_output(record['sessionId'])
+
+    def resume(self, record, text='continue'):
+        """Type "continue" (or the user's own text) into a stopped session. None when typed, else an error code. Only at an empty prompt:
+        a draft or a menu (e.g. Claude's own rate-limit options) on screen is left alone and reported."""
+        where = self.terminal(record)
+        if not where:
+            return 'NO_TERMINAL'
+        try:
+            screen = self.io.typed_screen(where)
+            if not EMPTY_PROMPT.search('\n'.join(screen.rstrip().splitlines()[-14:])):
+                return 'PROMPT_NOT_READY'
+            self.send(where, text=text)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 'TYPE_FAILED'
         return None
 
     def run(self, report, before=None):

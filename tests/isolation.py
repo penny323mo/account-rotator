@@ -47,6 +47,18 @@ class InertClaude:
 
 service.ClaudeAccounts = InertClaude
 service.WatchIO = inert_watch
+
+
+class InertAgyContinue:
+    """No real agy terminal is read or typed into from a test."""
+    def stopped(self):
+        return []
+
+    def send(self, session, text='continue'):
+        return 'TYPE_FAILED'
+
+
+service.AgyContinue = InertAgyContinue
 service.AccountAdder = inert_adder
 
 
@@ -87,6 +99,18 @@ class InertRemoteIO:
     def owned(self, link):
         return None
 
+    def last_message(self, session_id):
+        return None, False
+
+    def last_reply(self, session_id):
+        return None, False
+
+    def last_output(self, session_id):
+        return None, None
+
+    def last_error(self, session_id):
+        return None
+
     def records(self):
         return []
 
@@ -106,4 +130,5 @@ class InertRemoteIO:
         return 0
 
 
+REAL_REMOTE_IO = claude_remote.SystemIO  # for tests that only read a transcript file
 claude_remote.SystemIO = InertRemoteIO
