@@ -8,7 +8,7 @@ other terminals cannot be typed into and is not listed)."""
 import re
 import subprocess
 
-from claude_remote import TMUX
+from claude_remote import TMUX, type_literal
 
 QUOTA = re.compile(r'exhausted your quota|quota exhausted|resource[_ ]exhausted', re.I)
 
@@ -33,7 +33,7 @@ class SystemIO:
                               timeout=10, check=True).stdout
 
     def type(self, kind, target, text):
-        subprocess.run([TMUX, 'send-keys', '-t', target, '-l', text], capture_output=True, timeout=10, check=True)
+        type_literal(target, text)
         subprocess.run([TMUX, 'send-keys', '-t', target, 'Enter'], capture_output=True, timeout=10, check=True)
 
 

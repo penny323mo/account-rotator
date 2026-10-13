@@ -27,6 +27,14 @@ import urllib.request
 SESSIONS = os.path.expanduser('~/.claude/sessions')
 API = 'https://api.anthropic.com/v1/code/sessions/'
 TMUX = next((p for p in ('/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux') if os.path.exists(p)), 'tmux')
+TMUX_PIECE = 2000  # characters; tmux refuses a command over ~16 KB ("command too long"), 2000 x 4-byte chars fits
+
+
+def type_literal(target, text, tmux=TMUX):
+    """Type text into a tmux pane as-is, in pieces so long text (5000+ Chinese characters) is not refused."""
+    for i in range(0, len(text), TMUX_PIECE):
+        subprocess.run([tmux, 'send-keys', '-t', target, '-l', text[i:i + TMUX_PIECE]], capture_output=True,
+                       timeout=10, check=True)
 PICKUP = 45          # seconds for running sessions to pick up the new login before re-registering
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
 POLL = 10
@@ -68,8 +76,11 @@ class SystemIO:
             return False
 
     def tmux(self, pane, *keys, literal=False):
-        args = [TMUX, 'send-keys', '-t', pane] + (['-l'] if literal else []) + list(keys)
-        subprocess.run(args, capture_output=True, timeout=10, check=True)
+        if literal:
+            for text in keys:
+                type_literal(pane, text)
+            return
+        subprocess.run([TMUX, 'send-keys', '-t', pane] + list(keys), capture_output=True, timeout=10, check=True)
 
     def screen(self, pane):
         """The tmux pane's screen as text."""

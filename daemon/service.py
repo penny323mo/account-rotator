@@ -154,6 +154,9 @@ def transient(error):
             or error.endswith(('_HTTP_429', '_HTTP_500', '_HTTP_502', '_HTTP_503', '_HTTP_504')))
 
 
+CONTINUE_TEXT_MAX = 50000  # characters; Chinese is 3 bytes each, the request limits below allow it
+
+
 def continue_text(value):
     """What the page's continue button sends: "continue" unless the user typed something else (one line)."""
     if value is None:
@@ -161,7 +164,7 @@ def continue_text(value):
     if not isinstance(value, str):
         raise QuotaError('INVALID_TEXT')
     text = ' '.join(value.split())
-    if not text or len(text) > 10000:
+    if not text or len(text) > CONTINUE_TEXT_MAX:
         raise QuotaError('INVALID_TEXT')
     return text
 
@@ -2302,8 +2305,8 @@ def serve(root, service_factory=Service):
             self.connection.settimeout(90)
             ident = None
             try:
-                line = self.rfile.readline(65537)
-                if len(line) > 65536:
+                line = self.rfile.readline(262145)
+                if len(line) > 262144:
                     raise QuotaError('REQUEST_TOO_LARGE')
                 req = json.loads(line)
                 if not isinstance(req, dict) or req.get('jsonrpc') != '2.0':

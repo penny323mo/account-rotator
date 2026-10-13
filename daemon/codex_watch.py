@@ -264,7 +264,8 @@ class WatchIO:
 
     def type(self, target, text):
         """Type a prompt into the Codex CLI in that tmux pane (queued after the running turn)."""
-        subprocess.run(['tmux', 'send-keys', '-t', target, '-l', text], capture_output=True, timeout=10, check=True)
+        from claude_remote import type_literal
+        type_literal(target, text, 'tmux')
         subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'], capture_output=True, timeout=10, check=True)
 
     def release(self, target):

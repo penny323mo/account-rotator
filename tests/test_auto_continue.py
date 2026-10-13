@@ -226,17 +226,17 @@ class ContinueNowTests(unittest.TestCase):
         self.wait()
         self.codex.continue_thread.assert_called_once_with(T1, 'gpt-6-astra', prompt='繼續做 埋落去')
 
-    def test_ten_thousand_characters_fit_through_to_the_daemon(self):
+    def test_fifty_thousand_characters_fit_through_to_the_daemon(self):
         from service import continue_text
-        text = '繼' * 10000
+        text = '繼' * 50000
         self.assertEqual(continue_text(text), text)
         with self.assertRaises(QuotaError):
             continue_text(text + '續')
         line = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'codex.continue.now', 'params': {'text': text}},
                           ensure_ascii=False).encode()
-        self.assertLess(len(line), 65536)  # the daemon's request line limit
+        self.assertLess(len(line), 262144)  # the daemon's request line limit
         self.assertLess(len(json.dumps({'method': 'codex.continue.now', 'params': {'text': text}},
-                                       ensure_ascii=False).encode()), 65536)  # the web server's body limit
+                                       ensure_ascii=False).encode()), 262144)  # the web server's body limit
 
     def test_empty_text_is_refused(self):
         with self.assertRaises(QuotaError) as e:

@@ -490,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
             raise LookupError('JSON_REQUIRED')
         length = int(self.headers.get('Content-Length', '0'))
-        if not 0 < length <= 65536 or self.headers.get('Transfer-Encoding'):
+        if not 0 < length <= 262144 or self.headers.get('Transfer-Encoding'):
             raise ValueError()
         return json.loads(self.rfile.read(length))
 

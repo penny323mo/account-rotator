@@ -126,6 +126,19 @@ class LastOutputTests(unittest.TestCase):
                 claude_remote.PROJECTS = old
 
 
+class TypeLiteralTests(unittest.TestCase):
+    def test_long_text_is_typed_in_pieces_tmux_accepts(self):
+        from unittest import mock
+        import claude_remote
+        text = '繼' * 5000 + 'end'
+        with mock.patch.object(claude_remote.subprocess, 'run') as run:
+            claude_remote.type_literal('%1', text)
+        pieces = [c.args[0][-1] for c in run.call_args_list]
+        self.assertEqual(''.join(pieces), text)
+        self.assertTrue(all(len(p.encode()) <= 8000 for p in pieces))  # tmux refuses ~16 KB
+        self.assertTrue(all(c.args[0][1:5] == ['send-keys', '-t', '%1', '-l'] for c in run.call_args_list))
+
+
 class LastErrorTests(unittest.TestCase):
     def read(self, rows):
         import json, tempfile, claude_remote
