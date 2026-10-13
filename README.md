@@ -57,9 +57,9 @@ runs out, and start idle accounts' usage clocks.
   A switch by hand never continues anything by itself; "continue after a switch" follows only an automatic switch, and
   "continue once quota returns" works even with auto-switch off.
 - 使用中卡上面嘅 ▶：揀一個 session（Claude：所有行緊嘅；Codex／Antigravity：過去 24 小時有活動嘅），睇佢上一輪嘅完整
-  output，再送 prompt（最多 10000 字，撞上限嘅 session 預設係「continue」）。
+  output，再送 prompt（最多 50000 字，撞上限嘅 session 預設係「continue」）。
   ▶ on the live account's card: pick a session (Claude: every running one; Codex / Antigravity: active in the last
-  24 hours), read its whole last round of output, and send a prompt (up to 10000 characters; "continue" is prefilled
+  24 hours), read its whole last round of output, and send a prompt (up to 50000 characters; "continue" is prefilled
   for a session stopped on the limit).
 - Session 因為用量上限以外嘅錯誤停低（例如 model 爆滿、登入過期），表面睇似做完；app 會報出嚟並通知你。
   A session that stopped on an error other than the usage limit (model at capacity, expired login) looks finished;
