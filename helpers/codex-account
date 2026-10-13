@@ -570,6 +570,22 @@ def resume_command(plan, thread_id, prompt):
     return cmd + [prompt]
 
 
+TMUX_COMMAND_MAX = 8000  # bytes; tmux refuses a command over ~16 KB ("command too long", tmux 3.6a)
+
+
+def tmux_shell(cmd):
+    """The shell line tmux runs. A long prompt (23000 characters failed 2026-10-14) goes through a private file the
+    shell reads (and deletes) as it starts the CLI; returns (line, file or None)."""
+    line = shlex.join(cmd)
+    if len(line.encode()) <= TMUX_COMMAND_MAX:
+        return line, None
+    fd, path = tempfile.mkstemp(prefix="codex-prompt-")
+    with os.fdopen(fd, "w") as f:
+        f.write(cmd[-1])
+    q = shlex.quote(path)
+    return f'{shlex.join(cmd[:-1])} "$(cat {q}; rm -f {q})"', path
+
+
 def notify_rotator(thread, cwd, target):
     """Ask the Account Rotator daemon to watch this resumed thread (notify + record when it stops).
     Best effort: the resume itself does not depend on the daemon."""
@@ -652,10 +668,13 @@ def _continue(a, state):
         sys.exit(f"ERROR: project directory {plan['cwd']} not found")
     window = f"codex-{a.thread[-6:]}"
     exists = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True).returncode == 0
-    launch = (["tmux", "new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", plan["cwd"], shlex.join(cmd)] if exists else
-              ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", window, "-c", plan["cwd"], shlex.join(cmd)])
+    line, prompt_file = tmux_shell(cmd)
+    launch = (["tmux", "new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", plan["cwd"], line] if exists else
+              ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", window, "-c", plan["cwd"], line])
     r = subprocess.run(launch, capture_output=True, text=True)
     if r.returncode != 0:
+        if prompt_file:
+            os.unlink(prompt_file)
         sys.exit("ERROR: could not start tmux window for the resumed thread")
     res["tmux"] = f"{TMUX_SESSION}:{window}"
     res["watched"] = notify_rotator(a.thread, plan["cwd"], res["tmux"])

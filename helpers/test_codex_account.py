@@ -696,6 +696,32 @@ class ContinueTests(Base):
         self.assertIn('resume ' + self.TID, launch[-1])
 
 
+    def test_a_long_prompt_goes_through_a_file_tmux_accepts(self):
+        self.write_thread([self.settings(), self.context(), self.event('turn_aborted')])
+        calls = []
+        def fake(args, **kw):
+            calls.append(args)
+            return types.SimpleNamespace(returncode=0 if args[:2] != ['tmux', 'has-session'] else 1, stdout='', stderr='')
+        prompt = '繼續做落去，"$HOME" `x`\n' * 4000
+        with patch.object(m, 'app_running', return_value=False), patch.object(m.subprocess, 'run', side_effect=fake), \
+             patch.object(m.os.path, 'isdir', return_value=True), patch.object(m, 'notify_rotator', return_value=True):
+            self.run_continue(prompt=prompt)
+        line = calls[-1][-1]
+        self.assertLess(len(line.encode()), 2000)
+        self.assertIn('resume ' + self.TID, line)
+        tail = '"$(cat ' + line.split('"$(cat ', 1)[1]
+        path = m.shlex.split(tail[len('"$(cat '):].split(';')[0])[0]
+        try:
+            self.assertEqual(open(path).read(), prompt)
+            self.assertEqual(m.os.stat(path).st_mode & 0o777, 0o600)
+            out = m.subprocess.run(['sh', '-c', 'printf %s ' + tail], capture_output=True, text=True).stdout
+            self.assertEqual(out, prompt.rstrip('\n'))  # the shell hands the prompt over as one argument
+            self.assertFalse(m.os.path.exists(path))    # and deletes the file
+        finally:
+            if m.os.path.exists(path):
+                m.os.unlink(path)
+
+
 class WebCodexLoginTests(Base):
     OUTPUT = ('Welcome to Codex\n\x1b[1mFollow these steps\x1b[0m\n1. Open this link\n   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n'
               '2. Enter this one-time code (expires in 15 minutes)\n   \x1b[94mZAXT-QYP2R\x1b[0m\n')
