@@ -181,6 +181,11 @@ class RelinkerTests(unittest.TestCase):
             self.assertEqual(s.history, [])   # no message recalled or sent
         self.assertEqual([s.title for s in self.io.sessions.values()], ['Clawbook', 'Control room'])  # names kept
 
+    def test_a_newer_run_stops_this_one_before_any_key(self):
+        self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err)), stop=lambda: True)
+        self.assertEqual(self.reports, [])
+        self.assertEqual([s.link for s in self.io.sessions.values()], ['old-10', 'old-20'])
+
     def test_session_without_a_held_link_just_connects(self):
         self.io.sessions[10].connected = False
         self.run_it()

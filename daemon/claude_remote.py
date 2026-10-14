@@ -318,9 +318,10 @@ class Relinker:
             return 'TYPE_FAILED'
         return None
 
-    def run(self, report, before=None):
+    def run(self, report, before=None, stop=lambda: False):
         """Re-register every remote-controlled session; report(record, link_or_None, error_or_None) per session.
-        `before`: the sessions noted just before the switch (otherwise they are looked up now)."""
+        `before`: the sessions noted just before the switch (otherwise they are looked up now). `stop`: true once a
+        newer switch started its own run (2026-10-14 12:51-12:56 three runs overlapped, typing into the same sessions)."""
         pending = dict(before) if before is not None else self.remote_sessions()
         if not pending:
             return
@@ -328,6 +329,8 @@ class Relinker:
         started = self.io.now()
         while pending:
             for pid in list(pending):
+                if stop():
+                    return
                 record = next((r for r in self.io.records() if r.get('pid') == pid), None)
                 if record is None or not self.io.alive(pid):
                     pending.pop(pid)  # the session ended

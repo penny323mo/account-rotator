@@ -84,7 +84,7 @@ class ClaudeServiceTests(unittest.TestCase):
     def test_switch_reconnects_remote_control_and_logs_each_session(self):
         import threading
         done = threading.Event()
-        def run(report, before=None):
+        def run(report, before=None, stop=None):
             self.assertEqual(before, {1: {'name': 'Clawbook'}})  # noted before the switch
             report({'name': 'Clawbook'}, 'session_new', None)
             report({'name': 'Room'}, None, 'NO_TERMINAL')
@@ -98,6 +98,46 @@ class ClaudeServiceTests(unittest.TestCase):
         kinds = [(e['kind'], e.get('project'), e.get('error')) for e in self.s.events]
         self.assertIn(('claude_remote_relinked', 'Clawbook', None), kinds)
         self.assertIn(('claude_remote_failed', 'Room', 'NO_TERMINAL'), kinds)
+
+    def test_a_switch_onto_the_live_account_relinks_nothing(self):
+        # 2026-10-14 12:53 重設 onto the live CLAUDE_A started a second relink that typed into the same sessions
+        self.s.relinker.remote_sessions = Mock(return_value={1: {'name': 'Clawbook'}})
+        self.s.relinker.run = Mock()
+        self.s.refresh_claude(0)
+        self.claude.use.return_value = {'selected': 'CLAUDE_B', 'activation': 'UNCHANGED'}
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        time.sleep(0.05)
+        self.s.relinker.run.assert_not_called()
+        self.assertFalse(self.s.claude_relinking)
+
+    def test_a_newer_switch_stops_the_relink_still_running(self):
+        import threading
+        first_stopped, second_done, gate = threading.Event(), threading.Event(), threading.Event()
+        runs = []
+        def run(report, before=None, stop=lambda: False):
+            runs.append(stop)
+            if len(runs) == 1:
+                gate.wait(2)
+                if stop():
+                    first_stopped.set()
+            else:
+                second_done.set()
+        self.s.relinker.run = run
+        self.s.relinker.remote_sessions = Mock(return_value={1: {'name': 'Clawbook'}})
+        self.s.relinker.io = Mock(sleep=Mock())
+        self.s.refresh_claude(0)
+        self.claude.use.return_value = {'selected': 'CLAUDE_B', 'activation': 'OK'}
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        self.claude.use.return_value = {'selected': 'CLAUDE_A', 'activation': 'OK'}
+        for _ in range(100):
+            if runs:
+                break
+            time.sleep(0.01)
+        self.s.call('claude.use', {'label': 'CLAUDE_A'})
+        gate.set()
+        self.assertTrue(first_stopped.wait(2))
+        self.assertTrue(second_done.wait(2))
+        self.assertFalse(runs[1]())
 
     def test_manual_switch_records_and_marks_the_new_live_account(self):
         self.s.refresh_claude(0)

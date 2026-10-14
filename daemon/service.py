@@ -278,6 +278,7 @@ class Service:
             pass
         self.claude_waiting = False
         self.claude_relinking = False
+        self.claude_relink_gen = 0  # a newer switch's relink supersedes the one still running
         self.claude_continued = {}  # session id -> {'uuid', 'tries', 'at'}: what was already continued
         self.claude_continuing = False
         self.claude_lock = threading.Lock()
@@ -978,9 +979,12 @@ class Service:
                 self.event('claude_switched', selected=result['selected'], source=source)
             if source == 'manual':
                 self.claude_hand_over()
-            with self.lock:
-                self.claude_relinking = True  # set here so no poll can type "continue" before the relink starts
-            threading.Thread(target=self.claude_relink, args=(remote_before,), daemon=True).start()
+            if result.get('activation') != 'UNCHANGED':  # 重設 onto the live account: links are still right
+                with self.lock:
+                    self.claude_relinking = True  # set here so no poll can type "continue" before the relink starts
+                    self.claude_relink_gen += 1
+                    gen = self.claude_relink_gen
+                threading.Thread(target=self.claude_relink, args=(remote_before, gen), daemon=True).start()
             return result
         except QuotaError as e:
             with self.lock:
@@ -992,7 +996,7 @@ class Service:
             self.claude_lock.release()
             self.refresh_requested.set()
 
-    def claude_relink(self, before=None):
+    def claude_relink(self, before=None, gen=None):
         """Remote Control links belong to the old account after a switch: register them again (see claude_remote)."""
         def report(record, link, error):
             with self.lock:
@@ -1007,7 +1011,7 @@ class Service:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
         started = time.time()
         try:
-            self.relinker.run(report, before)
+            self.relinker.run(report, before, stop=lambda: gen is not None and gen != self.claude_relink_gen)
         except Exception:
             with self.lock:
                 self.event('claude_remote_failed', project='', error='RELINK_ERROR')
@@ -1018,7 +1022,8 @@ class Service:
                     self.relinker.io.sleep(left)
             finally:
                 with self.lock:
-                    self.claude_relinking = False
+                    if gen is None or gen == self.claude_relink_gen:  # a newer relink keeps the flag
+                        self.claude_relinking = False
 
     def claude_auto(self, now):
         """Claude Code sessions stopped on the usage limit get "continue" once the live account has quota again (its

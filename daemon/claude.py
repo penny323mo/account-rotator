@@ -57,7 +57,7 @@ class ClaudeAccounts:
                 raise ValueError()
         except (ValueError, AttributeError):
             raise QuotaError('CLAUDE_SWITCH_FAILED') from None
-        return {'selected': label, 'previous': result.get('previous')}
+        return {'selected': label, 'previous': result.get('previous'), 'activation': result.get('activation')}
 
     def warm(self, label):
         """One tiny `claude -p` with the account's own token in a throwaway config dir (live login untouched)."""
