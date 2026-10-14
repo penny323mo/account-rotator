@@ -15,7 +15,7 @@ Mechanism (verified against openai/codex source, codex-cli 0.156.1, macOS):
   Secrets move only through `security -i` stdin and the 0600 auth.json; never argv, stdout or logs.
   Metadata stores labels + hashed ids only.
 """
-import argparse, base64, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, zlib
+import argparse, base64, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, uuid, zlib
 import urllib.error, urllib.request
 from pathlib import Path
 
@@ -25,6 +25,9 @@ META = os.path.join(HOME, "profiles.json")
 SEC = "/usr/bin/security"
 CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Free usage resets ChatGPT grants (each clears the 5 h and weekly windows); same endpoints as the TUI's
+# "Redeem reset" (openai/codex backend-client rate_limit_resets.rs).
+RESETS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 QUOTA_MARKERS = ("usage limit", "rate limit", "Rate limit", "429", "quota", "Quota")
 WINDOWS = {18000: "5h", 604800: "weekly"}
 # `security -i` splits command lines longer than ~4090 bytes; the value must stay well below.
@@ -464,9 +467,20 @@ def cmd_list(a):
 
 
 def fetch_usage(access_token, account_id):
-    req = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": "Bearer " + access_token, "ChatGPT-Account-Id": account_id,
-        "Accept": "application/json", "User-Agent": "codex-account"})
+    return backend(USAGE_URL, access_token, account_id)
+
+
+def reset_credits(access_token, account_id):
+    return backend(RESETS_URL, access_token, account_id)
+
+
+def backend(url, access_token, account_id, body=None):
+    """GET url, or POST body as JSON."""
+    headers = {"Authorization": "Bearer " + access_token, "ChatGPT-Account-Id": account_id,
+               "Accept": "application/json", "User-Agent": "codex-account"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(), headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.load(r)
@@ -486,6 +500,7 @@ def usage_row(payload):
     row = {"status": "OK", "plan": payload.get("plan_type")}
     limits = payload.get("rate_limit") or {}
     row["limit_reached"] = bool(limits.get("limit_reached"))
+    row["resets"] = (payload.get("rate_limit_reset_credits") or {}).get("available_count") or 0
     for key, fallback in (("primary_window", "primary"), ("secondary_window", "secondary")):
         w = limits.get(key)
         if w:
@@ -508,6 +523,8 @@ def cmd_quota(a):
             if identity(data) != meta["profiles"].get(label, {}).get("id"):
                 raise UsageError("PROFILE_BROKEN")
             row = usage_row(fetch_usage(data["tokens"]["access_token"], data["tokens"]["account_id"]))
+            if row["resets"]:
+                row["reset_expires_at"] = first_expiry(data)
         except UsageError as e:
             row = {"status": str(e)}
         rows[label] = {**row, "active": label == active, "email": login_email(data)}
@@ -726,6 +743,43 @@ def cmd_remove(a):
     out({"removed": a.label}, a.json, f"removed: {a.label}")
 
 
+def available_resets(data):
+    """LABEL's unused resets, the one expiring first first."""
+    credits = reset_credits(data["tokens"]["access_token"], data["tokens"]["account_id"]).get("credits") or []
+    return sorted((c for c in credits if c.get("status") == "available"), key=lambda c: c.get("expires_at") or "~")
+
+
+def first_expiry(data):
+    try:
+        return next((c.get("expires_at") for c in available_resets(data)), None)
+    except UsageError:
+        return None
+
+
+def cmd_reset(a):
+    """Use one of LABEL's free usage resets (the one expiring first): its 5 h and weekly windows start again.
+    code: reset / nothing_to_reset (nothing used up, the reset is kept) / no_credit / already_redeemed."""
+    meta = load_meta()
+    if a.label not in meta["profiles"]:
+        sys.exit(f"ERROR: unknown profile {a.label}")
+    live = read_auth(live_home())[1]
+    data = live if label_for(meta, identity(live)) == a.label else decode(kc_read(a.label))
+    if identity(data) != meta["profiles"][a.label]["id"]:
+        sys.exit(f"ERROR: stored profile {a.label} is missing or malformed")
+    try:
+        credits = available_resets(data)
+        if not credits:
+            res = {"label": a.label, "code": "no_credit", "windows_reset": 0}
+        else:
+            r = backend(RESETS_URL + "/consume", data["tokens"]["access_token"], data["tokens"]["account_id"],
+                        {"redeem_request_id": str(uuid.uuid4()), "credit_id": credits[0]["id"]})
+            res = {"label": a.label, "code": r.get("code"), "windows_reset": r.get("windows_reset") or 0}
+    except UsageError as e:
+        out({"label": a.label, "code": "ERROR", "error": str(e)}, a.json, f"{a.label}: reset failed ({e})")
+        sys.exit(1)
+    out(res, a.json, f'{a.label}: {res["code"]}')
+
+
 def cmd_warm(a):
     """Start an idle account's usage clock with one tiny `codex exec` in a throwaway CODEX_HOME.
     The live login is never touched; refreshed tokens (refresh tokens are single-use) are saved back."""
@@ -799,12 +853,14 @@ def main():
     pr = sp.add_parser("probe"); pr.add_argument("label", nargs="?")
     pr.add_argument("--timeout", type=int, default=120)
     rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    rs = sp.add_parser("reset", help="use one of the account's free usage resets (5 h + weekly start again)")
+    rs.add_argument("label")
     w = sp.add_parser("warm", help="start an idle account's usage clock with one tiny prompt (live untouched)")
     w.add_argument("label"); w.add_argument("--timeout", type=int, default=120)
     a = p.parse_args()
     {"list": cmd_list, "current": cmd_current, "enroll": cmd_enroll, "login": cmd_login,
      "use": cmd_use, "quota": cmd_quota, "probe": cmd_probe, "continue": cmd_continue, "login-start": cmd_login_start,
-     "login-status": cmd_login_status, "login-cancel": cmd_login_cancel, "warm": cmd_warm, "remove": cmd_remove}[a.cmd](a)
+     "login-status": cmd_login_status, "login-cancel": cmd_login_cancel, "warm": cmd_warm, "remove": cmd_remove, "reset": cmd_reset}[a.cmd](a)
 
 
 if __name__ == "__main__":

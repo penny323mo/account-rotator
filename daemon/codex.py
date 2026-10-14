@@ -87,3 +87,16 @@ class CodexAccounts:
         except (ValueError, TypeError):
             raise QuotaError('CODEX_CONTINUE_FAILED') from None
         return {'tmux': result.get('tmux'), 'watched': result.get('watched') is True}
+
+    def reset(self, label):
+        """Use one of label's free usage resets (5 h and weekly start again). code: reset / nothing_to_reset (the
+        reset is kept) / no_credit / already_redeemed."""
+        proc = self._run('reset', label, timeout=60)
+        try:
+            result = json.loads(proc.stdout)
+            code = result['code']
+        except (ValueError, KeyError, TypeError):
+            raise QuotaError('CODEX_RESET_FAILED') from None
+        if proc.returncode or code == 'ERROR':
+            raise QuotaError(result.get('error') or 'CODEX_RESET_FAILED')
+        return {'code': code, 'windows_reset': result.get('windows_reset') or 0}

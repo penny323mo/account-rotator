@@ -1990,6 +1990,30 @@ class Service:
             self.codex_lock.release()
             self.refresh_requested.set()
 
+    def codex_reset_use(self, params):
+        """Use one of an account's free usage resets (pressed in 帳號管理). Nothing automatic follows."""
+        label = params.get('label')
+        with self.lock:
+            r = self.codex_state['profiles'].get(label) if isinstance(label, str) else None
+            if r is None:
+                raise QuotaError('UNKNOWN_PROFILE')
+            if not r.get('resets'):
+                raise QuotaError('NO_RESET_CREDIT')
+        if not self.codex_lock.acquire(blocking=False):
+            raise QuotaError('SWITCH_BUSY')
+        try:
+            result = self.codex.reset(label)
+            with self.lock:
+                self.event('codex_reset_used', selected=label, code=result['code'])
+            return result
+        except QuotaError as e:
+            with self.lock:
+                self.event('codex_reset_failed', selected=label, error=str(e))
+            raise
+        finally:
+            self.codex_lock.release()
+            self.refresh_requested.set()
+
     def poll_loop(self):
         # The master rotation switch NEVER gates this loop.
         while not self.stop.is_set():
@@ -2316,6 +2340,8 @@ class Service:
             return self.status()
         if method == 'codex.use':
             return self.codex_use(params)
+        if method == 'codex.reset.use':
+            return self.codex_reset_use(params)
         if method == 'accounts.add.start':
             return self.account_add_start(params)
         if method == 'accounts.add.finish':

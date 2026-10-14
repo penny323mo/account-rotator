@@ -536,6 +536,72 @@ class QuotaTests(Base):
         self.assertEqual(self.result()['profiles']['CODEX_B']['status'], 'TOKEN_EXPIRED')
 
 
+class ResetTests(Base):
+    CREDITS = {'credits': [
+        {'id': 'late', 'status': 'available', 'expires_at': '2026-11-07T00:02:31Z'},
+        {'id': 'used', 'status': 'redeemed', 'expires_at': '2026-10-20T00:00:00Z'},
+        {'id': 'early', 'status': 'available', 'expires_at': '2026-11-06T22:58:57Z'}], 'available_count': 2}
+
+    def setUp(self):
+        super().setUp()
+        self.enroll('CODEX_A', auth('A', access='stored-A'))
+        self.enroll('CODEX_B', auth('B', access='stored-B'))
+        self.put_live(auth('A', access='live-A'))
+        self.out.truncate(0); self.out.seek(0)
+        self.calls = []
+
+    def fake_backend(self, consumed):
+        def backend(url, token, account, body=None):
+            self.calls.append((url, token, account, body))
+            return consumed if body is not None else self.CREDITS
+        return backend
+
+    def test_the_reset_expiring_first_is_used_with_that_accounts_own_token(self):
+        with patch.object(m, 'backend', side_effect=self.fake_backend({'code': 'reset', 'windows_reset': 2})):
+            m.cmd_reset(types.SimpleNamespace(label='CODEX_B', json=True))
+        self.assertEqual(self.result(), {'label': 'CODEX_B', 'code': 'reset', 'windows_reset': 2})
+        (list_url, *listed), (url, token, account, body) = self.calls
+        self.assertEqual((list_url, listed[:2]), (m.RESETS_URL, ['stored-B', 'acct-B']))
+        self.assertEqual((url, token, account), (m.RESETS_URL + '/consume', 'stored-B', 'acct-B'))
+        self.assertEqual(body['credit_id'], 'early')
+        self.assertTrue(body['redeem_request_id'])
+
+    def test_the_live_account_uses_the_live_token(self):
+        with patch.object(m, 'backend', side_effect=self.fake_backend({'code': 'nothing_to_reset'})):
+            m.cmd_reset(types.SimpleNamespace(label='CODEX_A', json=True))
+        self.assertEqual(self.calls[-1][1], 'live-A')
+        self.assertEqual(self.result()['code'], 'nothing_to_reset')
+
+    def test_nothing_is_consumed_without_an_available_reset(self):
+        self.CREDITS = {'credits': [{'id': 'used', 'status': 'redeemed'}], 'available_count': 0}
+        with patch.object(m, 'backend', side_effect=self.fake_backend({'code': 'reset'})):
+            m.cmd_reset(types.SimpleNamespace(label='CODEX_B', json=True))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.result()['code'], 'no_credit')
+
+    def test_a_failed_request_exits_nonzero_without_secrets(self):
+        with patch.object(m, 'backend', side_effect=m.UsageError('TOKEN_EXPIRED')):
+            with self.assertRaises(SystemExit):
+                m.cmd_reset(types.SimpleNamespace(label='CODEX_B', json=True))
+        self.assertEqual(self.result(), {'label': 'CODEX_B', 'code': 'ERROR', 'error': 'TOKEN_EXPIRED'})
+        self.assertNotIn('stored-B', self.out.getvalue())
+
+    def test_quota_shows_how_many_resets_and_when_the_first_expires(self):
+        usage = {**QuotaTests.USAGE, 'rate_limit_reset_credits': {'available_count': 2}}
+        with patch.object(m, 'fetch_usage', return_value=usage), \
+                patch.object(m, 'reset_credits', return_value=self.CREDITS):
+            m.cmd_quota(types.SimpleNamespace(label='CODEX_B', json=True))
+        row = self.result()['profiles']['CODEX_B']
+        self.assertEqual((row['resets'], row['reset_expires_at']), (2, '2026-11-06T22:58:57Z'))
+
+    def test_quota_skips_the_reset_list_when_there_is_none(self):
+        with patch.object(m, 'fetch_usage', return_value=QuotaTests.USAGE), \
+                patch.object(m, 'reset_credits') as listed:
+            m.cmd_quota(types.SimpleNamespace(label='CODEX_B', json=True))
+        listed.assert_not_called()
+        self.assertEqual(self.result()['profiles']['CODEX_B']['resets'], 0)
+
+
 class ContinueTests(Base):
     TID = '01a0aa3c-1e93-79e1-89ea-c83e3001e106'
 

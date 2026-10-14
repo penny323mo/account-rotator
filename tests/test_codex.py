@@ -50,6 +50,22 @@ class CodexAccountsTests(unittest.TestCase):
         self.assertGreaterEqual(runner.call_args.kwargs['timeout'], 60)
         self.assertTrue(result['app_reopened'])
 
+    def test_reset_runs_the_helper_and_returns_its_code(self):
+        runner = Mock(return_value=proc(stdout=b'{"label":"CODEX_B","code":"reset","windows_reset":2}'))
+        result = CodexAccounts(Path('/h/codex-account'), runner).reset('CODEX_B')
+        self.assertEqual(runner.call_args.args[0], ['/h/codex-account', '--json', 'reset', 'CODEX_B'])
+        self.assertEqual(result, {'code': 'reset', 'windows_reset': 2})
+
+    def test_a_failed_reset_is_a_constant_code(self):
+        runner = Mock(return_value=proc(1, stdout=b'{"label":"CODEX_B","code":"ERROR","error":"TOKEN_EXPIRED"}'))
+        with self.assertRaises(QuotaError) as e:
+            CodexAccounts(Path('/h/x'), runner).reset('CODEX_B')
+        self.assertEqual(str(e.exception), 'TOKEN_EXPIRED')
+        runner = Mock(return_value=proc(1, stderr=b'Traceback ... secret'))
+        with self.assertRaises(QuotaError) as e:
+            CodexAccounts(Path('/h/x'), runner).reset('CODEX_B')
+        self.assertEqual(str(e.exception), 'CODEX_RESET_FAILED')
+
     def test_use_maps_helper_refusals(self):
         cases = [(proc(stdout=b'{"activation":"OK","selected":"CODEX_B","previous":"CODEX_A","codex_running":[1]}'), None),
                  (proc(2, stdout=b'{"activation":"ROLLED_BACK"}'), 'CODEX_ACTIVATION_ROLLED_BACK'),
@@ -111,6 +127,30 @@ class ServiceCodexTests(unittest.TestCase):
         with self.assertRaises(QuotaError):
             self.s.call('codex.use', {'label': 'NOPE'})
         self.codex.use.assert_not_called()
+
+    def test_a_reset_is_used_only_for_an_account_that_has_one(self):
+        self.codex.quota.return_value['profiles']['CODEX_B']['resets'] = 1
+        self.codex.reset.return_value = {'code': 'reset', 'windows_reset': 2}
+        self.s.refresh()
+        self.assertEqual(self.s.call('codex.reset.use', {'label': 'CODEX_B'})['code'], 'reset')
+        self.codex.reset.assert_called_once_with('CODEX_B')
+        self.assertEqual(self.s.events[-1], {**self.s.events[-1], 'kind': 'codex_reset_used', 'selected': 'CODEX_B',
+                                             'code': 'reset'})
+        self.codex.use.assert_not_called()
+        for label, error in (('CODEX_A', 'NO_RESET_CREDIT'), ('NOPE', 'UNKNOWN_PROFILE')):
+            with self.assertRaises(QuotaError) as e:
+                self.s.call('codex.reset.use', {'label': label})
+            self.assertEqual(str(e.exception), error)
+        self.assertEqual(self.codex.reset.call_count, 1)
+
+    def test_a_failed_reset_is_recorded_and_frees_the_lock(self):
+        self.codex.quota.return_value['profiles']['CODEX_B']['resets'] = 1
+        self.codex.reset.side_effect = QuotaError('TOKEN_EXPIRED')
+        self.s.refresh()
+        with self.assertRaises(QuotaError):
+            self.s.call('codex.reset.use', {'label': 'CODEX_B'})
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_reset_failed')
+        self.assertTrue(self.s.codex_lock.acquire(blocking=False))
 
     def test_codex_failure_is_recorded(self):
         self.s.refresh()
