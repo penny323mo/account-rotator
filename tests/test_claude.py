@@ -99,6 +99,73 @@ class ClaudeServiceTests(unittest.TestCase):
         self.assertIn(('claude_remote_relinked', 'Clawbook', None), kinds)
         self.assertIn(('claude_remote_failed', 'Room', 'NO_TERMINAL'), kinds)
 
+    def relink_with(self, runs):
+        """claude.use to CLAUDE_B with a relinker whose runs report what `runs` says, in turn."""
+        import threading
+        done, calls = threading.Event(), []
+        def run(report, before=None, stop=None):
+            calls.append(dict(before))
+            for pid, rec in before.items():
+                report(rec, *runs[len(calls) - 1])
+            if len(calls) == len(runs):
+                done.set()
+        self.s.relinker.run = run
+        self.s.relinker.remote_sessions = Mock(return_value={1: {'pid': 1, 'name': 'Clawbook'}})
+        self.s.relinker.io = Mock(sleep=Mock())
+        self.s.refresh_claude(0)
+        self.claude.use.return_value = {'selected': 'CLAUDE_B', 'activation': 'OK'}
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        self.assertTrue(done.wait(2))
+        for _ in range(200):
+            if not self.s.claude_relinking:
+                break
+            time.sleep(0.01)
+        return calls
+
+    def test_sessions_left_on_the_old_login_get_a_switch_away_and_back(self):
+        # 2026-10-14 12:51: no session followed B -> A; switching to B and back to A brought them over
+        calls = self.relink_with([(None, 'OLD_LOGIN'), ('session_new', None)])
+        self.assertEqual([c.args[0] for c in self.claude.use.call_args_list], ['CLAUDE_B', 'CLAUDE_A', 'CLAUDE_B'])
+        self.assertEqual(calls[1], {1: {'pid': 1, 'name': 'Clawbook'}})  # only the ones that missed it
+        kinds = [(e['kind'], e.get('error')) for e in self.s.events]
+        self.assertIn(('claude_login_nudge', None), kinds)
+        self.assertIn(('claude_remote_relinked', None), kinds)
+        self.assertNotIn(('claude_remote_failed', 'OLD_LOGIN'), kinds)  # it worked in the end
+        self.assertEqual(self.s.status()['claude']['active'], 'CLAUDE_B')
+
+    def test_still_on_the_old_login_after_the_nudge_is_reported_once(self):
+        self.relink_with([(None, 'OLD_LOGIN'), (None, 'OLD_LOGIN')])
+        self.assertEqual(len(self.claude.use.call_args_list), 3)  # one nudge, not a loop
+        self.assertEqual([e.get('error') for e in self.s.events if e['kind'] == 'claude_remote_failed'], ['OLD_LOGIN'])
+
+    def test_a_failed_nudge_puts_the_target_back_live(self):
+        def use(label):
+            if label == 'CLAUDE_A' and use.n == 1:
+                use.n += 1
+                raise QuotaError('CLAUDE_SWITCH_FAILED')
+            use.n += 1
+            return {'selected': label, 'activation': 'OK'}
+        use.n = 0
+        import threading
+        done = threading.Event()
+        def run(report, before=None, stop=None):
+            for rec in before.values():
+                report(rec, None, 'OLD_LOGIN')
+            done.set()
+        self.s.relinker.run = run
+        self.s.relinker.remote_sessions = Mock(return_value={1: {'pid': 1, 'name': 'Clawbook'}})
+        self.s.relinker.io = Mock(sleep=Mock())
+        self.s.refresh_claude(0)
+        self.claude.use.side_effect = use
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        self.assertTrue(done.wait(2))
+        for _ in range(200):
+            if not self.s.claude_relinking:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.s.status()['claude']['active'], 'CLAUDE_B')
+        self.assertIn('OLD_LOGIN', [e.get('error') for e in self.s.events if e['kind'] == 'claude_remote_failed'])
+
     def test_a_switch_onto_the_live_account_relinks_nothing(self):
         # 2026-10-14 12:53 重設 onto the live CLAUDE_A started a second relink that typed into the same sessions
         self.s.relinker.remote_sessions = Mock(return_value={1: {'name': 'Clawbook'}})
