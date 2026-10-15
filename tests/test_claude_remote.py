@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -116,6 +117,10 @@ class FakeIO:
     def poke(self):
         self.pokes += 1
 
+    def each(self, jobs):  # one after another: the fake clock is shared
+        for job in jobs:
+            job()
+
 
 NOTICE = 'Remote Control disconnected \u2014 signed-in claude.ai account or organization changed on this machine'
 
@@ -228,11 +233,10 @@ class RelinkerTests(unittest.TestCase):
             self.run_it()
         self.assertEqual([s.link for s in self.io.sessions.values()], ['old-10', 'old-20'])
 
-    def test_busy_session_waits_and_is_reported_when_it_stays_busy(self):
-        self.io.status[10] = 'busy'
+    def test_busy_tmux_session_is_relinked_without_waiting(self):
+        self.io.status[10] = 'busy'  # /remote-control runs mid-turn
         self.run_it()
-        self.assertIn(('Clawbook', None, 'STILL_BUSY'), self.reports)
-        self.assertEqual(self.io.sessions[10].link, 'old-10')  # never typed into a busy session
+        self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
 
     def test_session_outside_tmux_is_reported_not_guessed(self):
         del self.io.meta[20]['tmux']

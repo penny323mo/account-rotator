@@ -24,6 +24,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -40,7 +41,7 @@ def type_literal(target, text, tmux=TMUX):
     for i in range(0, len(text), TMUX_PIECE):
         subprocess.run([tmux, 'send-keys', '-t', target, '-l', text[i:i + TMUX_PIECE]], capture_output=True,
                        timeout=10, check=True)
-PICKUP = 45          # seconds for running sessions to pick up the new login before re-registering
+PICKUP = 5           # seconds after touching the credentials file before re-registering
 CHANGED = 'account or organization changed'
 CREDENTIALS = os.path.expanduser('~/.claude/.credentials.json')
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
@@ -241,6 +242,14 @@ class SystemIO:
     def sleep(self, seconds):
         time.sleep(seconds)
 
+    def each(self, jobs):
+        """Run the jobs at the same time and wait for all of them."""
+        threads = [threading.Thread(target=job, daemon=True) for job in jobs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
     def now(self):
         return time.time()
 
@@ -392,45 +401,37 @@ class Relinker:
         except OSError:
             pass
         self.io.sleep(self.pickup)
-        started, waiting = self.io.now(), {}
-        while pending:
-            for pid in list(pending):
-                if stop():
-                    return
-                record = next((r for r in self.io.records() if r.get('pid') == pid), None)
-                if record is None or not self.io.alive(pid):
-                    pending.pop(pid)  # the session ended
-                    continue
-                if record.get('status') != 'idle':
-                    waiting[pid] = 'STILL_BUSY'
-                    continue
-                where = self.terminal(record)
-                if not where:
-                    pending.pop(pid)
-                    report(record, None, 'NO_TERMINAL')
-                    continue
-                try:
-                    if not self.prompt_empty(where):
-                        waiting[pid] = 'PROMPT_NOT_READY'
-                        continue
-                    before = pending.pop(pid).get('bridgeSessionId')
-                    error = self.reregister(where, record.get('name'))
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    pending.pop(pid, None)
-                    before, error = None, 'TYPE_FAILED'
-                if error:
-                    report(record, None, error)
-                    continue
-                after = next((r for r in self.io.records() if r.get('pid') == pid), {}).get('bridgeSessionId')
-                if not after or after == before:
-                    report(record, None, 'NOT_RELINKED')
-                elif self.io.owned(after) is False:
-                    report(record, None, 'OLD_LOGIN')  # registered under the previous account
+        started = self.io.now()
+        self.io.each([lambda pid=pid: self.relink_one(pid, report, stop, started) for pid in pending])
+
+    def relink_one(self, pid, report, stop, started):
+        """One session, alongside the others: tried every poll until it is re-registered or the time limit passes."""
+        waiting = 'STILL_BUSY'
+        while not stop():
+            record = next((r for r in self.io.records() if r.get('pid') == pid), None)
+            if record is None or not self.io.alive(pid):
+                return  # the session ended
+            where = self.terminal(record)
+            if not where:
+                return report(record, None, 'NO_TERMINAL')
+            # a busy session is not waited for: /remote-control runs mid-turn (an "immediate" command)
+            try:
+                if not self.prompt_empty(where):
+                    waiting = 'PROMPT_NOT_READY'
                 else:
-                    report(record, after, None)
-            if pending and self.io.now() - started > self.limit:
-                for pid, record in pending.items():
-                    report(record, None, waiting.get(pid, 'STILL_BUSY'))
-                return
-            if pending:
-                self.io.sleep(self.poll)
+                    before = record.get('bridgeSessionId')
+                    error = self.reregister(where, record.get('name'))
+                    if error:
+                        return report(record, None, error)
+                    after = next((r for r in self.io.records() if r.get('pid') == pid), {}).get('bridgeSessionId')
+                    if not after or after == before:
+                        return report(record, None, 'NOT_RELINKED')
+                    if self.io.owned(after) is False:
+                        return report(record, None, 'OLD_LOGIN')  # registered under the previous account
+                    return report(record, after, None)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # a send that failed is tried again at the next poll
+                waiting = 'TYPE_FAILED'
+            if self.io.now() - started > self.limit:
+                return report(record, None, waiting)
+            self.io.sleep(self.poll)
