@@ -971,6 +971,7 @@ class Service:
                 remote_before = self.relinker.remote_sessions()
             except Exception:
                 remote_before = None
+            switched_at = time.time()
             result = self.claude.use(label)
             with self.lock:
                 self.claude_state['active'] = result['selected']
@@ -984,7 +985,7 @@ class Service:
                     self.claude_relinking = True  # set here so no poll can type "continue" before the relink starts
                     self.claude_relink_gen += 1
                     gen = self.claude_relink_gen
-                threading.Thread(target=self.claude_relink, args=(remote_before, gen, result['selected']),
+                threading.Thread(target=self.claude_relink, args=(remote_before, gen, switched_at),
                                  daemon=True).start()
             return result
         except QuotaError as e:
@@ -997,33 +998,24 @@ class Service:
             self.claude_lock.release()
             self.refresh_requested.set()
 
-    def claude_relink(self, before=None, gen=None, target=None):
-        """Remote Control links belong to the old account after a switch: register them again (see claude_remote).
-        Sessions still on the old login get one more try after switching to another account and back (claude_nudge)."""
+    def claude_relink(self, before=None, gen=None, since=None):
+        """Remote Control links belong to the old account after a switch: register them again once each session has
+        noticed the switch (see claude_remote)."""
         stop = lambda: gen is not None and gen != self.claude_relink_gen
-        missed = {}
-        def report(record, link, error, last=True):
+        def report(record, link, error):
             with self.lock:
                 name = record.get('name') or os.path.basename((record.get('cwd') or '').rstrip('/'))
-                if error == 'OLD_LOGIN' and not last:
-                    missed[record.get('pid')] = record  # tried again after claude_nudge
-                elif error:
+                if error:
                     self.event('claude_remote_failed', project=name, error=error)
                     if self.config['notify']:
-                        self.notifier(f"轉 Claude 帳號後，{name} 仲用緊舊帳號登入，轉走再轉返都唔得：要重開佢（claude --resume）先會轉"
+                        self.notifier(f"轉 Claude 帳號後，{name} 等咗 6 分鐘都冇跟到新帳號：要重開佢（claude --resume）先會轉"
                                       if error == 'OLD_LOGIN' else
                                       f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
                 else:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
         started = time.time()
         try:
-            self.relinker.run(lambda r, l, e: report(r, l, e, last=target is None), before, stop=stop)
-            if missed and not stop():
-                if self.claude_nudge(target, stop):
-                    self.relinker.run(report, missed, stop=stop)
-                elif not stop():
-                    for record in missed.values():
-                        report(record, None, 'OLD_LOGIN')
+            self.relinker.run(report, before, stop=stop, since=since)
         except Exception:
             with self.lock:
                 self.event('claude_remote_failed', project='', error='RELINK_ERROR')
@@ -1036,53 +1028,6 @@ class Service:
                 with self.lock:
                     if gen is None or gen == self.claude_relink_gen:  # a newer relink keeps the flag
                         self.claude_relinking = False
-
-    def claude_nudge(self, target, stop=lambda: False):
-        """2026-10-14 12:51 HKT no running session noticed a switch to CLAUDE_A (all re-registered under the old
-        account); what brought them over was switching to another account and back (12:54 B, 12:57 A). Done the same
-        way here: another enrolled account for PICKUP seconds, then the target again. True when both switches went
-        through."""
-        with self.lock:
-            others = [l for l, r in sorted(self.claude_state['profiles'].items()) if l != target and r.get('status') == 'OK']
-        if not target or not others or not self.claude_lock.acquire(timeout=60):  # the switch that started it may still hold it
-            return False
-        if stop():  # a newer switch went first and runs its own relink
-            self.claude_lock.release()
-            return False
-        live = target
-        try:
-            with self.lock:
-                self.claude_state['switching'] = True
-                self.event('claude_login_nudge', selected=target, via=others[0])
-            for label in (others[0], target):
-                self.claude.use(label)
-                live = label
-                with self.lock:
-                    self.claude_state['active'] = label
-                    for name, r in self.claude_state['profiles'].items():
-                        r['active'] = name == label
-                if label != target:
-                    self.relinker.io.sleep(PICKUP)  # long enough for the sessions to notice this account
-            return True
-        except QuotaError as e:
-            with self.lock:
-                self.event('claude_switch_failed', error=str(e))
-            if live != target:  # never leave the live login on the account we only passed through
-                try:
-                    self.claude.use(target)
-                    live = target
-                except QuotaError:
-                    pass
-            with self.lock:
-                self.claude_state['active'] = live
-                for name, r in self.claude_state['profiles'].items():
-                    r['active'] = name == live
-            return False
-        finally:
-            with self.lock:
-                self.claude_state['switching'] = False
-            self.claude_lock.release()
-            self.refresh_requested.set()
 
     def claude_auto(self, now):
         """Claude Code sessions stopped on the usage limit get "continue" once the live account has quota again (its

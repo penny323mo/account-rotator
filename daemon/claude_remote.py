@@ -11,10 +11,16 @@ its tmux pane (sessions in other terminals cannot be typed into and are reported
   new link under the live account (without the name the phone lists it as "<hostname>-local-<random words>"). Every key after the first is sent only once the screen shows what it expects (Up at an
   empty prompt would recall the last message); anything unexpected is closed with Escape and reported.
 
-A new bridgeSessionId means it registered again, and only counts once the live login can see it: a session that has
-not noticed the switch (some never print "signed-in claude.ai account ... changed") registers under the OLD account,
-and only a restart (claude --resume) moves it. Sessions are never restarted: a session still busy after the time
-limit, or whose terminal cannot be found, is reported for the user to handle."""
+Nothing is typed before the session has noticed the switch, or /remote-control registers under the OLD account.
+Why some sessions miss it (Claude Code 2.1.289, read from its code on 2026-10-15): each process caches the Keychain for
+30 s; when ~/.claude.json changes, a session whose cache still holds the old token judges the identity "unchanged" and
+then ignores every further change for 5 minutes (owner-pin R=300000). After that any re-read of ~/.claude.json makes it
+check again, so once the 5 minutes are over the file is touched (content untouched) every 30 s until each one has
+noticed: it prints "signed-in claude.ai account or organization changed" and drops its link. Switching to another
+account and back inside those 5 minutes does nothing (the 2026-10-14 "nudge" never worked).
+
+A new bridgeSessionId only counts once the live login can see it (OLD_LOGIN otherwise). Sessions are never restarted:
+a session still busy after the time limit, or whose terminal cannot be found, is reported for the user to handle."""
 import glob
 import json
 import os
@@ -23,6 +29,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 SESSIONS = os.path.expanduser('~/.claude/sessions')
 API = 'https://api.anthropic.com/v1/code/sessions/'
@@ -36,6 +43,11 @@ def type_literal(target, text, tmux=TMUX):
         subprocess.run([tmux, 'send-keys', '-t', target, '-l', text[i:i + TMUX_PIECE]], capture_output=True,
                        timeout=10, check=True)
 PICKUP = 45          # seconds for running sessions to pick up the new login before re-registering
+COOLDOWN = 310       # a session that judged the switch "unchanged" ignores ~/.claude.json changes for 5 minutes
+POKE = 30            # after that, touch ~/.claude.json this often until every session noticed
+NOTICE_LIMIT = 360   # a session that still has not noticed is re-registered anyway (and checked with owned())
+CHANGED = 'account or organization changed'
+CLAUDE_JSON = os.path.expanduser('~/.claude.json')
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
 POLL = 10
 MENU = 'Disconnect this session'
@@ -196,6 +208,32 @@ class SystemIO:
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             return None
 
+    def notices(self, session_id, tail=2 * 1024 * 1024):
+        """[(time, text)] of the Remote Control lines Claude Code wrote into its transcript (its tail), oldest first."""
+        paths = glob.glob(os.path.join(PROJECTS, '*', f'{session_id}.jsonl'))
+        if not paths:
+            return []
+        with open(paths[0], 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail))
+            data = f.read().decode('utf-8', 'replace')
+        out = []
+        for line in data.splitlines():
+            if 'Remote Control' not in line:
+                continue
+            try:
+                d = json.loads(line)
+                at = datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            if d.get('type') == 'system' and isinstance(d.get('content'), str) and 'Remote Control' in d['content']:
+                out.append((at, d['content']))
+        return out
+
+    def poke(self):
+        """Touch ~/.claude.json (content untouched): every Claude Code re-reads it and checks its login again."""
+        os.utime(CLAUDE_JSON)
+
     def typed_screen(self, pane):
         """The tmux pane's screen without dim text: Claude's greyed-out prompt suggestion is not something typed."""
         out = subprocess.run([TMUX, 'capture-pane', '-p', '-e', '-t', pane], capture_output=True, text=True,
@@ -210,14 +248,47 @@ class SystemIO:
 
 
 class Relinker:
-    def __init__(self, io=None, pickup=PICKUP, limit=LIMIT, poll=POLL):
+    def __init__(self, io=None, pickup=PICKUP, limit=LIMIT, poll=POLL, cooldown=COOLDOWN, poke=POKE,
+                 notice_limit=NOTICE_LIMIT):
         self.io = io or SystemIO()
         self.pickup, self.limit, self.poll = pickup, limit, poll
+        self.cooldown, self.poke, self.notice_limit = cooldown, poke, notice_limit
 
     def remote_sessions(self):
         """Running Claude Code sessions that have a Remote Control link: {pid: record}."""
         return {r['pid']: r for r in self.io.records()
                 if r.get('bridgeSessionId') and isinstance(r.get('pid'), int) and self.io.alive(r['pid'])}
+
+    def dropped_sessions(self):
+        """Sessions whose link an earlier switch took away and nobody brought back: {pid: record}. Their last Remote
+        Control line is Claude Code's own account-changed notice (one the user disconnected ends otherwise)."""
+        out = {}
+        for r in self.io.records():
+            if r.get('bridgeSessionId') or r.get('kind', 'interactive') != 'interactive' \
+                    or not isinstance(r.get('pid'), int) or not r.get('sessionId') or not self.io.alive(r['pid']):
+                continue
+            try:
+                lines = self.io.notices(r['sessionId'])
+            except OSError:
+                continue
+            if lines and CHANGED in lines[-1][1]:
+                out[r['pid']] = r
+        return out
+
+    def noticed(self, record, before, since):
+        """It runs on the new login: it had no link to begin with, Claude Code dropped the link, or it printed the
+        account-changed notice after the switch."""
+        if not before.get('bridgeSessionId') or record.get('bridgeSessionId') != before.get('bridgeSessionId'):
+            return True
+        try:
+            return any(at >= since - 5 and CHANGED in text for at, text in self.io.notices(record.get('sessionId')))
+        except OSError:
+            return False
+
+    def prompt_empty(self, where):
+        """Its input line holds nothing: a draft is never sent along with /remote-control."""
+        screen = self.io.typed_screen(where)
+        return bool(EMPTY_PROMPT.search('\n'.join(screen.rstrip().splitlines()[-14:])))
 
     def terminal(self, record):
         """The session's tmux pane, or None outside tmux."""
@@ -318,15 +389,21 @@ class Relinker:
             return 'TYPE_FAILED'
         return None
 
-    def run(self, report, before=None, stop=lambda: False):
+    def run(self, report, before=None, stop=lambda: False, since=None):
         """Re-register every remote-controlled session; report(record, link_or_None, error_or_None) per session.
-        `before`: the sessions noted just before the switch (otherwise they are looked up now). `stop`: true once a
-        newer switch started its own run (2026-10-14 12:51-12:56 three runs overlapped, typing into the same sessions)."""
+        `before`: the sessions noted just before the switch (otherwise they are looked up now); sessions an earlier
+        switch left without a link are added. `since`: when the switch happened. `stop`: true once a newer switch
+        started its own run (2026-10-14 12:51-12:56 three runs overlapped, typing into the same sessions)."""
+        since = self.io.now() if since is None else since
         pending = dict(before) if before is not None else self.remote_sessions()
+        try:
+            pending.update({pid: r for pid, r in self.dropped_sessions().items() if pid not in pending})
+        except (OSError, ValueError):
+            pass
         if not pending:
             return
         self.io.sleep(self.pickup)
-        started = self.io.now()
+        started, poked, waiting = self.io.now(), None, {}
         while pending:
             for pid in list(pending):
                 if stop():
@@ -335,17 +412,26 @@ class Relinker:
                 if record is None or not self.io.alive(pid):
                     pending.pop(pid)  # the session ended
                     continue
-                if record.get('status') != 'idle':
+                if not self.noticed(record, pending[pid], since) and self.io.now() - since < self.notice_limit:
+                    waiting[pid] = 'OLD_LOGIN'
                     continue
-                before = pending.pop(pid).get('bridgeSessionId')
+                if record.get('status') != 'idle':
+                    waiting[pid] = 'STILL_BUSY'
+                    continue
                 where = self.terminal(record)
                 if not where:
+                    pending.pop(pid)
                     report(record, None, 'NO_TERMINAL')
                     continue
                 try:
+                    if not self.prompt_empty(where):
+                        waiting[pid] = 'PROMPT_NOT_READY'
+                        continue
+                    before = pending.pop(pid).get('bridgeSessionId')
                     error = self.reregister(where, record.get('name'))
                 except (OSError, ValueError, subprocess.SubprocessError):
-                    error = 'TYPE_FAILED'
+                    pending.pop(pid, None)
+                    before, error = None, 'TYPE_FAILED'
                 if error:
                     report(record, None, error)
                     continue
@@ -356,9 +442,17 @@ class Relinker:
                     report(record, None, 'OLD_LOGIN')  # registered under the previous account
                 else:
                     report(record, after, None)
-            if pending and self.io.now() - started > self.limit:
-                for record in pending.values():
-                    report(record, None, 'STILL_BUSY')
+            now = self.io.now()
+            if pending and now - since >= self.cooldown and (poked is None or now - poked >= self.poke) and \
+                    any(waiting.get(pid) == 'OLD_LOGIN' for pid in pending):
+                try:
+                    self.io.poke()
+                except OSError:
+                    pass
+                poked = now
+            if pending and now - started > self.limit:
+                for pid, record in pending.items():
+                    report(record, None, waiting.get(pid, 'STILL_BUSY'))
                 return
             if pending:
                 self.io.sleep(self.poll)

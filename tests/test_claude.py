@@ -84,7 +84,7 @@ class ClaudeServiceTests(unittest.TestCase):
     def test_switch_reconnects_remote_control_and_logs_each_session(self):
         import threading
         done = threading.Event()
-        def run(report, before=None, stop=None):
+        def run(report, before=None, stop=None, since=None):
             self.assertEqual(before, {1: {'name': 'Clawbook'}})  # noted before the switch
             report({'name': 'Clawbook'}, 'session_new', None)
             report({'name': 'Room'}, None, 'NO_TERMINAL')
@@ -103,7 +103,8 @@ class ClaudeServiceTests(unittest.TestCase):
         """claude.use to CLAUDE_B with a relinker whose runs report what `runs` says, in turn."""
         import threading
         done, calls = threading.Event(), []
-        def run(report, before=None, stop=None):
+        def run(report, before=None, stop=None, since=None):
+            self.since = since
             calls.append(dict(before))
             for pid, rec in before.items():
                 report(rec, *runs[len(calls) - 1])
@@ -122,49 +123,14 @@ class ClaudeServiceTests(unittest.TestCase):
             time.sleep(0.01)
         return calls
 
-    def test_sessions_left_on_the_old_login_get_a_switch_away_and_back(self):
-        # 2026-10-14 12:51: no session followed B -> A; switching to B and back to A brought them over
-        calls = self.relink_with([(None, 'OLD_LOGIN'), ('session_new', None)])
-        self.assertEqual([c.args[0] for c in self.claude.use.call_args_list], ['CLAUDE_B', 'CLAUDE_A', 'CLAUDE_B'])
-        self.assertEqual(calls[1], {1: {'pid': 1, 'name': 'Clawbook'}})  # only the ones that missed it
-        kinds = [(e['kind'], e.get('error')) for e in self.s.events]
-        self.assertIn(('claude_login_nudge', None), kinds)
-        self.assertIn(('claude_remote_relinked', None), kinds)
-        self.assertNotIn(('claude_remote_failed', 'OLD_LOGIN'), kinds)  # it worked in the end
-        self.assertEqual(self.s.status()['claude']['active'], 'CLAUDE_B')
-
-    def test_still_on_the_old_login_after_the_nudge_is_reported_once(self):
-        self.relink_with([(None, 'OLD_LOGIN'), (None, 'OLD_LOGIN')])
-        self.assertEqual(len(self.claude.use.call_args_list), 3)  # one nudge, not a loop
+    def test_a_session_still_on_the_old_login_is_reported_and_nothing_switches_again(self):
+        # 2026-10-15: the 2026-10-14 "switch away and back" ran inside Claude Code's 5-minute cooldown and never helped
+        before = time.time()
+        calls = self.relink_with([(None, 'OLD_LOGIN')])
+        self.assertEqual([c.args[0] for c in self.claude.use.call_args_list], ['CLAUDE_B'])
+        self.assertEqual(len(calls), 1)
         self.assertEqual([e.get('error') for e in self.s.events if e['kind'] == 'claude_remote_failed'], ['OLD_LOGIN'])
-
-    def test_a_failed_nudge_puts_the_target_back_live(self):
-        def use(label):
-            if label == 'CLAUDE_A' and use.n == 1:
-                use.n += 1
-                raise QuotaError('CLAUDE_SWITCH_FAILED')
-            use.n += 1
-            return {'selected': label, 'activation': 'OK'}
-        use.n = 0
-        import threading
-        done = threading.Event()
-        def run(report, before=None, stop=None):
-            for rec in before.values():
-                report(rec, None, 'OLD_LOGIN')
-            done.set()
-        self.s.relinker.run = run
-        self.s.relinker.remote_sessions = Mock(return_value={1: {'pid': 1, 'name': 'Clawbook'}})
-        self.s.relinker.io = Mock(sleep=Mock())
-        self.s.refresh_claude(0)
-        self.claude.use.side_effect = use
-        self.s.call('claude.use', {'label': 'CLAUDE_B'})
-        self.assertTrue(done.wait(2))
-        for _ in range(200):
-            if not self.s.claude_relinking:
-                break
-            time.sleep(0.01)
-        self.assertEqual(self.s.status()['claude']['active'], 'CLAUDE_B')
-        self.assertIn('OLD_LOGIN', [e.get('error') for e in self.s.events if e['kind'] == 'claude_remote_failed'])
+        self.assertGreaterEqual(self.since, before)  # the relinker knows when the switch happened
 
     def test_a_switch_onto_the_live_account_relinks_nothing(self):
         # 2026-10-14 12:53 重設 onto the live CLAUDE_A started a second relink that typed into the same sessions
@@ -181,7 +147,7 @@ class ClaudeServiceTests(unittest.TestCase):
         import threading
         first_stopped, second_done, gate = threading.Event(), threading.Event(), threading.Event()
         runs = []
-        def run(report, before=None, stop=lambda: False):
+        def run(report, before=None, stop=lambda: False, since=None):
             runs.append(stop)
             if len(runs) == 1:
                 gate.wait(2)
