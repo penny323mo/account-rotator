@@ -17,6 +17,7 @@ from codex_watch import WatchIO, timestamp_of
 from claude import ClaudeAccounts
 from claude_remote import PICKUP, Relinker
 from agy_continue import AgyContinue
+import gemini_app
 from enroll import AccountAdder
 import re
 from quota import Profiles, QuotaClient, QuotaError, stamp, timestamp
@@ -240,7 +241,7 @@ def metrics(row, config, now):
 
 class Service:
     def __init__(self, root, profiles=None, client=None, broker=None, busy=None, notifier=None, codex=None, watch_io=None, adder=None, claude=None,
-                 relinker=None, agy_continue=None):
+                 relinker=None, agy_continue=None, gemini_app_=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
@@ -260,6 +261,8 @@ class Service:
         self.watch_io = watch_io or WatchIO()
         self.claude = claude or ClaudeAccounts()
         self.relinker = relinker or Relinker()
+        self.gemini_app = gemini_app_ or gemini_app.GeminiApp(gemini_app.SystemIO(names=self.root / 'gemini_app.json'))
+        self.gemini_app_lock = threading.Lock()
         self.claude_target = None  # {'sessionId', 'at'}: the session ▶ keeps talking to
         self.agy_target = None     # the agy session ▶ keeps talking to
         try:  # kept across restarts
@@ -1933,6 +1936,26 @@ class Service:
             self.codex_lock.release()
             self.refresh_requested.set()
 
+    def gemini_app_use(self, params):
+        """The Gemini Mac app onto another of its signed-in accounts (closes and reopens it; see gemini_app)."""
+        account = params.get('account')
+        if not isinstance(account, str):
+            raise QuotaError('INVALID_PARAMS')
+        if not self.gemini_app_lock.acquire(blocking=False):
+            raise QuotaError('SWITCH_BUSY')
+        try:
+            result = self.gemini_app.use(account)
+        except QuotaError as e:
+            with self.lock:
+                self.event('gemini_app_failed', error=str(e))
+            raise
+        finally:
+            self.gemini_app_lock.release()
+        with self.lock:
+            label = next((a['label'] for a in result['accounts'] if a['id'] == account), None)
+            self.event('gemini_app_switched', selected=label or account)
+        return result
+
     def codex_reset_use(self, params):
         """Use one of an account's free usage resets (pressed in 帳號管理). Nothing automatic follows."""
         label = params.get('label')
@@ -2285,6 +2308,10 @@ class Service:
             return self.codex_use(params)
         if method == 'codex.reset.use':
             return self.codex_reset_use(params)
+        if method == 'geminiapp.state':
+            return self.gemini_app.state()
+        if method == 'geminiapp.use':
+            return self.gemini_app_use(params)
         if method == 'accounts.add.start':
             return self.account_add_start(params)
         if method == 'accounts.add.finish':

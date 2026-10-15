@@ -34,7 +34,7 @@ from quota import QuotaError
 
 ASSETS = Path(__file__).parent
 METHODS = {'refresh', 'enabled.set', 'config.set', 'config.defaults', 'use',
-           'cancel', 'pause', 'resume', 'recovery.ack', 'codex.use', 'codex.reset.use', 'codex.auto.set', 'codex.autocontinue.set', 'warmup.set', 'accounts.add.start', 'accounts.add.finish', 'accounts.add.cancel', 'accounts.remove', 'provider.reset', 'claude.use', 'claude.waitcontinue.set', 'codex.waitcontinue.set', 'codex.continue.now', 'claude.continue.now', 'agy.continue.now', 'continue.preview', 'continue.sessions'}
+           'cancel', 'pause', 'resume', 'recovery.ack', 'codex.use', 'codex.reset.use', 'geminiapp.state', 'geminiapp.use', 'codex.auto.set', 'codex.autocontinue.set', 'warmup.set', 'accounts.add.start', 'accounts.add.finish', 'accounts.add.cancel', 'accounts.remove', 'provider.reset', 'claude.use', 'claude.waitcontinue.set', 'codex.waitcontinue.set', 'codex.continue.now', 'claude.continue.now', 'agy.continue.now', 'continue.preview', 'continue.sessions'}
 # What a paired device may do unless full control is on.
 REMOTE_METHODS = {'refresh', 'use', 'codex.use', 'claude.use', 'pause', 'resume', 'cancel'}
 # Handled here, never by the daemon, and only on this Mac.
