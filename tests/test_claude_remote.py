@@ -101,7 +101,6 @@ class FakeIO:
     def now(self):
         return self.clock
 
-    late = ()     # pids that missed the switch: they notice only once ~/.claude.json is touched
     never = ()    # pids that never notice
     lines = {}    # pid -> Remote Control lines of a session without a link
     pokes = 0
@@ -110,7 +109,7 @@ class FakeIO:
         pid = int(session_id.split('-')[1])
         if pid not in self.sessions or self.sessions[pid].link is None:
             return self.lines.get(pid, [])
-        if pid in self.never or (pid in self.late and not self.pokes):
+        if pid in self.never:
             return []
         return [(self.clock, NOTICE)]
 
@@ -274,28 +273,19 @@ class RelinkerTests(unittest.TestCase):
         self.assertEqual(self.r.resume(record), 'PROMPT_NOT_READY')
         self.assertEqual(self.io.sessions[20].history, [])
 
-    def slow(self):
-        """The real timings: 5-minute cooldown, then a touch every 30 s; give up waiting after 6 minutes."""
-        self.r = Relinker(self.io, pickup=45, limit=1800, poll=10)
+    def test_the_credentials_file_is_touched_before_anything_is_typed(self):
+        # 2026-10-15 21:50: sessions kept their in-memory token and registered under the old account for 6 minutes
+        typed = []
+        self.io.poke = lambda: typed.append(('poke', list(self.io.sessions[10].history), self.io.sessions[10].link))
+        self.run_it()
+        self.assertEqual(typed, [('poke', [], 'old-10')])
+
+    def test_a_session_that_never_noticed_the_switch_is_relinked_at_once(self):
+        self.io.never = (20,)  # no account-changed notice, still holding the old link
         self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err, self.io.clock)))
-
-    def test_a_session_that_missed_the_switch_is_left_alone_until_it_notices(self):
-        self.io.late = (20,)  # its Keychain cache still held the old login: it ignores changes for 5 minutes
-        self.slow()
-        clawbook, room = sorted(self.reports)
-        self.assertEqual(clawbook[:3], ('Clawbook', 'new-10-1', None))
-        self.assertLess(clawbook[3], 100)                      # the one that noticed is relinked at once
-        self.assertEqual(room[:3], ('Control room', 'new-20-1', None))
-        self.assertGreaterEqual(room[3], 310)                  # not typed into before the cooldown and a touch
-        self.assertEqual(self.io.pokes, 1)
-
-    def test_one_that_never_notices_is_tried_after_6_minutes_and_reported_if_still_old(self):
-        self.io.never, self.io.stale = (20,), (20,)
-        self.slow()
         room = next(r for r in self.reports if r[0] == 'Control room')
-        self.assertEqual(room[1:3], (None, 'OLD_LOGIN'))
-        self.assertGreaterEqual(room[3], 360)
-        self.assertGreater(self.io.pokes, 1)                   # touched every 30 s meanwhile
+        self.assertEqual(room[1:3], ('new-20-1', None))
+        self.assertLess(room[3], 100)
 
     def test_a_link_an_earlier_switch_dropped_is_brought_back(self):
         self.io.sessions[10].link, self.io.sessions[10].connected = None, False  # noticed the last switch

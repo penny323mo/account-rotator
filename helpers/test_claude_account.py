@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import time
 import types
@@ -262,6 +263,8 @@ class UseTests(Base):
         self.stack.enter_context(patch.object(m, 'write_live_item', side_effect=write_item))
         self.stack.enter_context(patch.object(m, 'write_claude_json_account', side_effect=lambda acc: setattr(self, 'account', acc)))
         self.stack.enter_context(patch.object(m, 'fcntl'))
+        self.credentials = os.path.join(m.HOME, '.credentials.json')
+        self.stack.enter_context(patch.object(m, 'CREDENTIALS_FILE', self.credentials))
         self.live = None  # read_live is driven by item/account above
         self.run_cmd(m.cmd_enroll, label='CLAUDE_A')
         self.store['CLAUDE_B'] = m.encode(creds('b', rt='rt-b'))
@@ -279,6 +282,19 @@ class UseTests(Base):
         self.assertEqual(self.item['claudeAiOauth']['refreshToken'], 'rt-b')
         self.assertEqual(self.item['mcpOAuth'], {'plugin:supabase': {'accessToken': 'mcp'}})  # MCP logins kept
         self.assertEqual(self.account['accountUuid'], 'b')
+
+    def test_running_sessions_are_told_through_the_credentials_file_time(self):
+        with open(self.credentials, 'w') as f:
+            f.write('{"stale": true}')
+        os.utime(self.credentials, (1, 1))
+        self.use('CLAUDE_B')
+        self.assertGreater(os.stat(self.credentials).st_mtime, 1)
+        with open(self.credentials) as f:
+            self.assertEqual(f.read(), '{"stale": true}')  # content untouched
+
+    def test_a_missing_credentials_file_is_not_created(self):
+        self.use('CLAUDE_B')
+        self.assertFalse(os.path.exists(self.credentials))
 
     def test_live_tokens_claude_code_rotated_are_saved_back_first(self):
         self.use('CLAUDE_B')

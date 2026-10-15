@@ -971,7 +971,6 @@ class Service:
                 remote_before = self.relinker.remote_sessions()
             except Exception:
                 remote_before = None
-            switched_at = time.time()
             result = self.claude.use(label)
             with self.lock:
                 self.claude_state['active'] = result['selected']
@@ -985,7 +984,7 @@ class Service:
                     self.claude_relinking = True  # set here so no poll can type "continue" before the relink starts
                     self.claude_relink_gen += 1
                     gen = self.claude_relink_gen
-                threading.Thread(target=self.claude_relink, args=(remote_before, gen, switched_at),
+                threading.Thread(target=self.claude_relink, args=(remote_before, gen),
                                  daemon=True).start()
             return result
         except QuotaError as e:
@@ -998,9 +997,8 @@ class Service:
             self.claude_lock.release()
             self.refresh_requested.set()
 
-    def claude_relink(self, before=None, gen=None, since=None):
-        """Remote Control links belong to the old account after a switch: register them again once each session has
-        noticed the switch (see claude_remote)."""
+    def claude_relink(self, before=None, gen=None):
+        """Remote Control links belong to the old account after a switch: register them again (see claude_remote)."""
         stop = lambda: gen is not None and gen != self.claude_relink_gen
         def report(record, link, error):
             with self.lock:
@@ -1008,14 +1006,14 @@ class Service:
                 if error:
                     self.event('claude_remote_failed', project=name, error=error)
                     if self.config['notify']:
-                        self.notifier(f"轉 Claude 帳號後，{name} 等咗 6 分鐘都冇跟到新帳號：要重開佢（claude --resume）先會轉"
+                        self.notifier(f"轉 Claude 帳號後，{name} 重連咗遙控但仍然屬於舊帳號：要重開佢（claude --resume）先會轉"
                                       if error == 'OLD_LOGIN' else
                                       f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
                 else:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
         started = time.time()
         try:
-            self.relinker.run(report, before, stop=stop, since=since)
+            self.relinker.run(report, before, stop=stop)
         except Exception:
             with self.lock:
                 self.event('claude_remote_failed', project='', error='RELINK_ERROR')

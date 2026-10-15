@@ -5,7 +5,10 @@ Mechanism (verified against Claude Code 2.1.289, macOS):
   The live login is the Keychain item "Claude Code-credentials" (account = $USER); its JSON holds
   `claudeAiOauth` (access/refresh token, expiry, scopes, plan) next to `mcpOAuth` (MCP server logins, which
   this tool never touches). The matching profile (email, account/org uuid) is `oauthAccount` in ~/.claude.json.
-  Running Claude Code sessions re-read the Keychain item about every 30 s.
+  A running Claude Code keeps its token in memory and reads the Keychain again only when the modification time of
+  ~/.claude/.credentials.json (its plaintext fallback) changed, or its token is about to expire (2.1.289 code,
+  2026-10-15: sessions kept calling the API and registering Remote Control as the old account for hours). So a switch
+  touches that file (time only; it is never created): each session's next request reads the new login.
 
   Refresh tokens rotate on every refresh (Claude Code writes them back with compare-and-swap), so every
   account has exactly one live copy: the enrolled copy in the Keychain (service "claude-account-broker",
@@ -28,6 +31,7 @@ LIVE_SVC = "Claude Code-credentials"
 HOME = os.path.expanduser(os.environ.get("CLAUDE_ACCOUNT_HOME", "~/.claude-account"))
 META = os.path.join(HOME, "profiles.json")
 CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_ACCOUNT_CLAUDE_JSON", "~/.claude.json"))
+CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 SEC = "/usr/bin/security"
 CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 API = "https://api.anthropic.com"
@@ -402,8 +406,8 @@ def cmd_use(a):
 
 
 def _cmd_use_locked(a):
-    """Make an enrolled account the live Claude Code login. Running sessions follow within ~30 s (they re-read the
-    Keychain); nothing is closed. The live login is saved back into its own profile first (tokens rotate)."""
+    """Make an enrolled account the live Claude Code login. Running sessions follow on their next request (see
+    tell_sessions); nothing is closed. The live login is saved back into its own profile first (tokens rotate)."""
     meta = load_meta()
     if a.label not in meta["profiles"]:
         sys.exit(f"ERROR: unknown profile {a.label}")
@@ -442,8 +446,17 @@ def _cmd_use_locked(a):
         out({"selected": None, "previous": prev, "activation": "ROLLED_BACK" if rolled else "ROLLBACK_FAILED",
              "error": str(e)}, a.json, f"ERROR: switch failed ({e}); {'rolled back to ' + str(prev) if rolled else 'CHECK CURRENT LOGIN'}")
         sys.exit(2)
+    tell_sessions()
     out({"selected": a.label, "previous": prev, "activation": "OK"}, a.json,
-        f"live: {a.label} (was {prev}); running Claude Code sessions follow within ~30 s")
+        f"live: {a.label} (was {prev}); running Claude Code sessions follow on their next request")
+
+
+def tell_sessions():
+    """Make every running Claude Code drop its in-memory token (see the module docstring)."""
+    try:
+        os.utime(CREDENTIALS_FILE)
+    except FileNotFoundError:
+        pass  # without the file Claude Code reads the Keychain on each check anyway
 
 
 def cmd_current(a):
