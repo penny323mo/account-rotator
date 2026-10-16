@@ -419,6 +419,16 @@ class QuotaTests(unittest.TestCase):
             self.assertEqual(client.access_token(token, 'test-audience', 'test-id'), 'test-access')
             request.assert_called_once()
 
+    def test_requests_name_agys_cli_client(self):
+        # Google returns the Gemini quota group only to agy's own client string (2026-10-16).
+        import quota
+        opener = Mock()
+        opener.open.return_value.__enter__ = Mock(return_value=Mock(read=Mock(return_value=b'{}')))
+        opener.open.return_value.__exit__ = Mock(return_value=False)
+        with patch('urllib.request.build_opener', return_value=opener):
+            quota.request(quota.BASE + 'retrieveUserQuotaSummary', {'project': 'p'}, 'access')
+        self.assertTrue(opener.open.call_args.args[0].get_header('User-agent').startswith('antigravity/cli/'))
+
     def test_unsupported_client_fails_closed(self):
         with self.assertRaisesRegex(QuotaError, 'OAUTH_CLIENT_UNSUPPORTED'):
             QuotaClient().oauth_client('unknown')

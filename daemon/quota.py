@@ -20,6 +20,9 @@ from pathlib import Path
 CLIENT_ID_HASH = 'bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea'
 CLIENT_SECRET_HASH = '1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60'  # gitleaks:allow (a SHA-256 used to recognise the secret, not the secret)
 BASE = 'https://daily-cloudcode-pa.googleapis.com/v1internal:'
+# Since 2026-10-16 the quota summary has the Gemini group only for agy's own client string ("antigravity/cli/<version>";
+# any version works); a bare "antigravity" gets the Claude and GPT group alone.
+USER_AGENT = 'antigravity/cli/1.3.6'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 
 
@@ -129,7 +132,7 @@ def request(url, data, access=None):
     form = url == TOKEN_URL
     body = urllib.parse.urlencode(data).encode() if form else json.dumps(data).encode()
     headers = {'Content-Type': 'application/x-www-form-urlencoded' if form else 'application/json',
-               'User-Agent': 'antigravity'}
+               'User-Agent': USER_AGENT}
     if access:
         headers['Authorization'] = 'Bearer ' + access
     try:
