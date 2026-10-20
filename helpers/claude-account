@@ -301,8 +301,11 @@ def end_login(state, error=None):
 
 def cmd_login_start(a):
     meta = load_meta()
-    if not LABEL_RE.match(a.label) or a.label in meta["profiles"]:
-        sys.exit("ERROR: label must look like CLAUDE_B and not be enrolled yet")
+    if not LABEL_RE.match(a.label):
+        sys.exit("ERROR: label must look like CLAUDE_B")
+    if a.label in meta["profiles"] and label_for(meta, identity(read_live())) == a.label:
+        # a switch away saves the live login back over this profile: sign the live one in again in Claude Code
+        sys.exit(f"ERROR: {a.label} is the live account; sign in again with /login in Claude Code")
     if os.path.exists(login_state_path()):
         sys.exit("ERROR: another sign-in is already in progress; finish or cancel it first")
     os.makedirs(HOME, mode=0o700, exist_ok=True)
@@ -345,8 +348,10 @@ def cmd_login_finish(a):
         end_login(state, "sign-in did not complete (code wrong or expired?)")
     meta = load_meta()
     owner = label_for(meta, lid)
-    if owner:
+    if owner and owner != state["label"]:
         end_login(state, f"that Claude account is already enrolled as {owner}")
+    if state["label"] in meta["profiles"] and owner != state["label"]:
+        end_login(state, f'that is not the account enrolled as {state["label"]}')  # signing in again: same account only
     kc_write(state["label"], encode(data))
     if identity(decode(kc_read(STORE_SVC, state["label"]) or "")) != lid:
         end_login(state, "stored copy failed verification")

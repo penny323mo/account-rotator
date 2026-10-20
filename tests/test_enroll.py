@@ -129,3 +129,13 @@ class RemoveAccountTests(unittest.TestCase):
             self.s.call('accounts.remove', {'provider': 'gemini', 'label': 'GEMINI_A'})
         self.assertEqual(str(e.exception), 'ENROLLMENT_IN_PROGRESS')
         self.adder.remove.assert_not_called()
+
+
+class AdderFailureTests(unittest.TestCase):
+    def test_signing_in_again_as_another_account_is_named(self):
+        from enroll import AccountAdder
+        proc = Mock(returncode=1, stderr=b'ERROR: that is not the account enrolled as CLAUDE_C\n', stdout=b'')
+        adder = AccountAdder(helpers={'claude': '/x'}, runner=Mock(return_value=proc))
+        with self.assertRaises(QuotaError) as e:
+            adder.finish('claude', 'code#state')
+        self.assertEqual(str(e.exception), 'WRONG_ACCOUNT')

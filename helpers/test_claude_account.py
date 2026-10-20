@@ -204,10 +204,35 @@ class LoginTests(Base):
     def test_start_prints_the_sign_in_url_from_claude(self):
         self.assertEqual(self.start()['url'], self.URL)
 
-    def test_start_refuses_bad_or_taken_labels(self):
-        for label in ('claude_b', 'CLAUDE_A', 'CLAUDE_B; rm'):
+    def test_start_refuses_bad_labels(self):
+        for label in ('claude_b', 'CLAUDE_B; rm'):
             with self.assertRaises(SystemExit):
                 self.start(label)
+
+    def test_an_enrolled_account_signs_in_again_and_keeps_its_name(self):
+        m.read_live.side_effect = lambda: None
+        self.start('CLAUDE_A')
+        d = self.config_dir()
+        self.private = creds('a', rt='rt-fresh')
+        self.assertEqual(self.finish()['enrolled'], 'CLAUDE_A')
+        self.assertEqual(m.decode(self.store['CLAUDE_A'])['oauth']['refreshToken'], 'rt-fresh')
+        self.cleaned(d)
+
+    def test_signing_in_again_with_another_account_is_refused(self):
+        m.read_live.side_effect = lambda: None
+        self.start('CLAUDE_A')
+        before = self.store['CLAUDE_A']
+        self.private = creds('b', rt='rt-b')
+        with self.assertRaises(SystemExit) as e:
+            self.finish()
+        self.assertIn('not the account', str(e.exception))
+        self.assertEqual(self.store['CLAUDE_A'], before)
+
+    def test_the_live_account_is_not_signed_in_again_here(self):
+        m.read_live.side_effect = lambda: creds('a')
+        with self.assertRaises(SystemExit) as e:
+            self.start('CLAUDE_A')
+        self.assertIn('/login', str(e.exception))
 
     def test_finish_enrolls_the_new_account_and_cleans_up_the_private_login(self):
         self.start()

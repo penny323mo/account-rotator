@@ -11,7 +11,8 @@ FAILURES = {b'already enrolled': 'ALREADY_ENROLLED', b'did not complete': 'SIGN_
             b'already in progress': 'ENROLLMENT_IN_PROGRESS', b'could not stop': 'CLOSE_TIMEOUT_NOT_ADDED',
             b'does not look like': 'INVALID_AUTH_CODE', b'not enrolled': 'LIVE_NOT_ENROLLED',
             b'did not show a sign-in URL': 'AGY_NO_SIGNIN_URL', b'unexpected agy login menu': 'AGY_LOGIN_SCREEN_CHANGED',
-            b'is the live account': 'ACCOUNT_IN_USE', b'unknown profile': 'UNKNOWN_PROFILE'}
+            b'is the live account': 'ACCOUNT_IN_USE', b'unknown profile': 'UNKNOWN_PROFILE',
+            b'not the account enrolled': 'WRONG_ACCOUNT'}
 
 
 class AccountAdder:
