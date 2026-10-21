@@ -50,13 +50,13 @@ class Base(unittest.TestCase):
     def api(self, path, access):
         self.calls.append((path, access))
         if path == '/api/oauth/profile':
-            return {'account': {'uuid': access[3:]}}
+            return {'account': {'uuid': access[3:].removesuffix('-new')}}
         return {'five_hour': {'utilization': 63.0, 'resets_at': '2026-10-05T04:50:00Z'},
                 'seven_day': {'utilization': 38.0, 'resets_at': '2026-10-06T05:00:00Z'}}
 
     def fake_refresh(self, oauth):
         self.refreshes.append(oauth['refreshToken'])
-        return dict(oauth, accessToken=oauth['accessToken'] + '-new', refreshToken=oauth['refreshToken'] + '-new',
+        return dict(oauth, accessToken=getattr(self, 'refresh_to', None) or oauth['accessToken'] + '-new', refreshToken=oauth['refreshToken'] + '-new',
                     expiresAt=(NOW + 28800) * 1000)
 
     def run_cmd(self, fn, **kw):
@@ -342,6 +342,37 @@ class UseTests(Base):
         with self.assertRaises(SystemExit):
             self.use('CLAUDE_B')
         self.assertEqual(self.item['claudeAiOauth']['refreshToken'], 'rt-a-rotated')
+
+    def test_another_accounts_live_token_is_not_saved_over_the_previous_account(self):
+        self.item['claudeAiOauth'] = dict(self.item['claudeAiOauth'], accessToken='at-b')  # a session wrote B's token
+        before = self.store['CLAUDE_A']
+        r = self.use('CLAUDE_B')
+        self.assertEqual(r['activation'], 'OK')
+        self.assertEqual(self.store['CLAUDE_A'], before)
+        self.assertNotIn('relogin', m.load_meta()['profiles']['CLAUDE_A'])  # its own copy is still its own
+
+    def test_a_previous_account_whose_copy_is_another_accounts_needs_signing_in_again(self):
+        self.item['claudeAiOauth'] = dict(self.item['claudeAiOauth'], accessToken='at-b')
+        self.store['CLAUDE_A'] = m.encode(dict(creds('a'), oauth=dict(creds('a')['oauth'], accessToken='at-b')))
+        self.use('CLAUDE_B')
+        self.assertTrue(m.load_meta()['profiles']['CLAUDE_A']['relogin'])
+        self.out.seek(0)
+        self.out.truncate()
+        self.live = None
+        rows = self.run_cmd(m.cmd_quota, label='CLAUDE_A')['profiles']
+        self.assertEqual(rows['CLAUDE_A']['status'], 'RELOGIN_REQUIRED')
+        with self.assertRaises(SystemExit):
+            self.use('CLAUDE_A')
+        self.assertEqual(self.account['accountUuid'], 'b')
+
+    def test_a_refresh_that_returns_another_accounts_token_is_not_kept(self):
+        self.store['CLAUDE_B'] = m.encode(creds('b', rt='rt-b', expires_in=10))
+        self.refresh_to = 'at-a'
+        with self.assertRaises(m.UsageError):
+            m.idle_access(m.load_meta(), 'CLAUDE_B')
+        self.assertEqual(m.decode(self.store['CLAUDE_B'])['oauth']['refreshToken'], 'rt-b')
+        self.assertTrue(m.load_meta()['profiles']['CLAUDE_B']['relogin'])
+
 
 class WriterTests(unittest.TestCase):
     def test_claude_json_keeps_every_other_setting_and_its_mode(self):

@@ -207,11 +207,33 @@ def stored(meta, label):
 
 def idle_access(meta, label):
     """A usable access token for an idle account, refreshing (and saving the new pair) when needed."""
+    if meta["profiles"][label].get("relogin"):
+        raise UsageError("RELOGIN_REQUIRED")
     data = stored(meta, label)
     if data["oauth"].get("expiresAt", 0) / 1000 - time.time() < REFRESH_MARGIN:
         data["oauth"] = refresh(data["oauth"])
+        if not token_is_its_own(data):
+            mark_relogin(meta, label)
+            raise UsageError("RELOGIN_REQUIRED")
         kc_write(label, encode(data))
     return data["oauth"]["accessToken"]
+
+
+def token_is_its_own(data):
+    """False only when the API names another account than the one the login is filed under. A running Claude Code
+    session can write a refreshed token of the account it started with into the live Keychain item while
+    ~/.claude.json names the account switched to (seen 2026-10-21: CLAUDE_A's copy held CLAUDE_C's token)."""
+    try:
+        uuid = (api_get("/api/oauth/profile", data["oauth"]["accessToken"]).get("account") or {}).get("uuid")
+    except UsageError:
+        return True  # cannot tell (expired, offline)
+    return not uuid or uuid == data["account"]["accountUuid"]
+
+
+def mark_relogin(meta, label):
+    """The stored copy holds another account's token: it is never used again; signing in again clears this."""
+    meta["profiles"][label]["relogin"] = True
+    save_meta(meta)
 
 
 def usage_row(payload):
@@ -416,6 +438,8 @@ def _cmd_use_locked(a):
     meta = load_meta()
     if a.label not in meta["profiles"]:
         sys.exit(f"ERROR: unknown profile {a.label}")
+    if meta["profiles"][a.label].get("relogin"):
+        sys.exit(f"ERROR: {a.label} holds another account's login; sign it in again first")
     try:
         target = stored(meta, a.label)
     except UsageError:
@@ -428,7 +452,13 @@ def _cmd_use_locked(a):
         return
     if identity(live) and not prev:
         sys.exit("ERROR: live account is not enrolled; enroll it first so it is not lost")
-    if prev:
+    if prev and not token_is_its_own(live):
+        try:  # the live token is another account's: never file it under prev, and check prev's own copy
+            if not token_is_its_own(stored(meta, prev)):
+                mark_relogin(meta, prev)
+        except UsageError:
+            pass
+    elif prev:
         kc_write(prev, encode(live))  # keep the tokens Claude Code rotated
         if identity(decode(kc_read(STORE_SVC, prev) or "")) != meta["profiles"][prev]["id"]:
             sys.exit(f"ERROR: could not save {prev} back; live state untouched")
@@ -473,7 +503,7 @@ def cmd_current(a):
 def cmd_list(a):
     meta = load_meta()
     active = label_for(meta, identity(read_live()))
-    rows = {label: {"active": label == active, "ok": identity(decode(kc_read(STORE_SVC, label) or "")) == p["id"]}
+    rows = {label: {"active": label == active, "ok": not p.get("relogin") and identity(decode(kc_read(STORE_SVC, label) or "")) == p["id"]}
             for label, p in sorted(meta["profiles"].items())}
     out({"profiles": rows}, a.json,
         "\n".join(f'{"*" if r["active"] else " "} {label:10} {"READY" if r["ok"] else "BROKEN"}' for label, r in rows.items()))
