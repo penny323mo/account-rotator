@@ -235,8 +235,9 @@ def metrics(row, config, now):
     group = next((g for g in row.get('groups', []) if g['family'] == config['family']), None)
     if not group:
         return None
-    values = [group['windows'].get(w, {}).get('remaining_percent') for w in config['windows']]
-    return values if all(type(v) in (int, float) and 0 <= v <= 100 for v in values) else None
+    # a window Google does not report has no limit (since 2026-10-22 some accounts get the weekly one only)
+    values = [group['windows'][w].get('remaining_percent') for w in config['windows'] if w in group['windows']]
+    return values if values and all(type(v) in (int, float) and 0 <= v <= 100 for v in values) else None
 
 
 class Service:
@@ -511,7 +512,7 @@ class Service:
             item = (weekly if isinstance(weekly, (int, float)) else usable, weekly_reset, wins['5h'][1],
                     (label, why(label, usable, weekly or 0, weekly_reset, now)))
             if urgent(weekly, weekly_reset, now):
-                if isinstance(five, (int, float)) and five >= config['remaining_below']:
+                if not isinstance(five, (int, float)) or five >= config['remaining_below']:
                     first.append((weekly_reset, item[3]))  # absolute priority, earliest reset first
                 continue
             if min(values) < config['remaining_below']:
@@ -2029,8 +2030,9 @@ class Service:
         live_weekly = live['weekly'][0] if live else None
         # Live quota lost within 6 h is burned: only its 5 h window (or the weekly running out) moves us on.
         burning = bool(live) and urgent(live_weekly, live['weekly'][1], now)
-        low = config['usage_enabled'] and (live['5h'][0] < config['remaining_below'] if burning
-                                           else min(current) < config['remaining_below'])
+        live_five = live['5h'][0] if live else None
+        low = config['usage_enabled'] and ((isinstance(live_five, (int, float)) and live_five < config['remaining_below'])
+                                           if burning else min(current) < config['remaining_below'])
         normal = self.tiers(now)[0]
         park = (config['usage_enabled'] and not low and not burning and isinstance(live_weekly, (int, float))
                 and live_weekly < PRIORITY_HEADROOM and bool(normal))

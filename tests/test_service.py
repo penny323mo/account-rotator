@@ -167,6 +167,17 @@ class ServiceTests(unittest.TestCase):
         self.s.tick()
         self.broker.switch.assert_not_called()
 
+    def test_an_account_without_a_5h_window_still_rotates_on_its_weekly_one(self):
+        def weekly_only(label, weekly):
+            r = row(label, weekly=weekly)
+            del r['groups'][0]['windows']['5h']  # Google reports no 5 h window for some accounts
+            return r
+        self.s.set_enabled(True)
+        self.s.rows = {'A': weekly_only('A', 1), 'B': weekly_only('B', 100), 'C': row('C', 5, 60)}
+        self.assertEqual(metrics(self.s.rows['A'], self.s.config, time.time()), [1])
+        self.s.tick()
+        self.assertEqual(self.broker.switch.call_args[0][0], 'B')
+
     def test_refresh_failure_marks_old_values_stale(self):
         self.client.fetch.side_effect = QuotaError('QUOTA_HTTP_403')
         self.s.refresh()
