@@ -165,7 +165,8 @@ def normalize(data):
         if not isinstance(group, dict):
             continue
         name = str(group.get('displayName', ''))
-        family = 'gemini' if 'gemini' in name.lower() else (
+        # Gemini 4 Argon has its own group (since 2026-10-23, accounts it was rolled out to); kept apart from Gemini
+        family = 'argon' if 'argon' in name.lower() else 'gemini' if 'gemini' in name.lower() else (
             'claude_gpt' if any(x in name.lower() for x in ('claude', 'gpt')) else None)
         if not family:
             continue

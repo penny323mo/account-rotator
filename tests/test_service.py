@@ -411,6 +411,13 @@ class QuotaTests(unittest.TestCase):
         self.assertIsNone(result[0]['windows']['5h']['remaining_percent'])
         self.assertEqual(result[1]['windows']['5h']['remaining_percent'], 100)
 
+    def test_the_gemini_4_argon_group_is_kept_apart_from_gemini(self):
+        result = normalize({'groups': [
+            {'displayName': 'Gemini Models', 'buckets': [{'window': '5h', 'remainingFraction': .4}]},
+            {'displayName': 'Gemini 4 Argon', 'buckets': [{'window': 'weekly', 'remainingFraction': 1}]}]})
+        self.assertEqual([g['family'] for g in result], ['gemini', 'argon'])
+        self.assertEqual(result[0]['windows']['5h']['remaining_percent'], 40)
+
     def test_nan_or_out_of_range_is_not_ready(self):
         for bad in (float('nan'), -1, 2, True, '0.9'):
             with self.assertRaises(QuotaError):
