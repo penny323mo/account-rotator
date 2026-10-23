@@ -1,4 +1,5 @@
 """No live Keychain/process operations: verify the existing command's contract."""
+import base64
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -487,3 +488,41 @@ class LoginBrowserTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+def blob(sub=None, refresh='r', access='a'):
+    d = {'auth_method': 'consumer', 'token': {'access_token': access, 'refresh_token': refresh}}
+    if sub:
+        claims = base64.urlsafe_b64encode(json.dumps({'iss': m.GOOGLE_ISS, 'sub': sub}).encode()).decode().rstrip('=')
+        d['id_token'] = f'h.{claims}.s'
+    else:
+        d['id_token_email'] = 'x@example.com'  # agy 1.4.6 rewrites the live item like this on token refresh
+    return m.encode_blob(d)
+
+
+class NewCredentialFormatTests(unittest.TestCase):
+    """agy 1.4.6 drops the id_token from the live item; the account is still the one whose refresh token it holds."""
+    def setUp(self):
+        self.store = {(m.STORE_SVC, 'GEMINI_A'): blob('sa', 'ra'), (m.STORE_SVC, 'GEMINI_B'): blob('sb', 'rb')}
+        self.meta = {'profiles': {k[1]: {'id': m.identity(v)} for k, v in self.store.items()}}
+        for target, value in (('load_meta', lambda: self.meta), ('kc_read', lambda s, a: self.store.get((s, a)))):
+            p = patch.object(m, target, side_effect=value); p.start(); self.addCleanup(p.stop)
+
+    def test_a_live_item_without_id_token_is_the_account_holding_its_refresh_token(self):
+        self.assertEqual(m.identity(blob(None, 'rb', 'fresh')), self.meta['profiles']['GEMINI_B']['id'])
+        self.assertIsNone(m.identity(blob(None, 'unknown')))
+
+    def test_keeping_a_refreshed_live_item_keeps_the_stored_identity(self):
+        kept = m.for_store(blob(None, 'rb', 'fresh'), self.store[(m.STORE_SVC, 'GEMINI_B')])
+        self.assertEqual(m.decode_blob(kept)['token']['access_token'], 'fresh')
+        self.store[(m.STORE_SVC, 'GEMINI_B')] = kept
+        self.assertEqual(m.identity(kept), self.meta['profiles']['GEMINI_B']['id'])
+
+    def test_a_sign_in_without_id_token_is_identified_by_google(self):
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        with patch.object(m.urllib.request, 'urlopen', return_value=Reply(b'{"sub": "sc"}')):
+            lid, raw = m.google_identity(blob(None, 'rc'))
+        self.assertEqual(lid, m.identity(blob('sc', 'other')))
+        self.assertEqual(m.identity(raw), lid)

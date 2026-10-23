@@ -59,14 +59,30 @@ def credential(raw):
         elif raw.startswith(b'go-keyring-encoded:'):
             raw = bytes.fromhex(raw.split(b':', 1)[1].decode())
         d = json.loads(raw)
+        if not isinstance(d.get('token'), dict):
+            raise ValueError()
+        if not d.get('id_token'):
+            # Signed in with agy 1.4.6+, which keeps no id_token; the helper recorded Google's sub at sign-in.
+            sub = d['account_sub']
+            return d['token'], None, hashlib.sha256(f'https://accounts.google.com|{sub}'.encode()).hexdigest()[:12]
         payload = d['id_token'].split('.')[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
         ident = hashlib.sha256(f"{claims['iss']}|{claims['sub']}".encode()).hexdigest()[:12]
-        if not isinstance(d.get('token'), dict):
-            raise ValueError()
         return d['token'], claims['aud'], ident
     except Exception:
         raise QuotaError('MALFORMED_CREDENTIAL') from None
+
+
+def refresh_token(raw):
+    try:
+        if raw.startswith(b'go-keyring-base64:'):
+            raw = base64.b64decode(raw.split(b':', 1)[1], validate=True)
+        elif raw.startswith(b'go-keyring-encoded:'):
+            raw = bytes.fromhex(raw.split(b':', 1)[1].decode())
+        value = json.loads(raw)['token']['refresh_token']
+        return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
 
 
 class Profiles:
@@ -96,17 +112,35 @@ class Profiles:
                 raw = base64.b64decode(raw.split(b':', 1)[1], validate=True)
             elif raw.startswith(b'go-keyring-encoded:'):
                 raw = bytes.fromhex(raw.split(b':', 1)[1].decode())
-            payload = json.loads(raw)['id_token'].split('.')[1]
-            claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
-            email = claims.get('email')
+            d = json.loads(raw)
+            if d.get('id_token'):
+                payload = d['id_token'].split('.')[1]
+                email = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))).get('email')
+            else:
+                email = d.get('id_token_email')
             return email if isinstance(email, str) and re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email) and len(email) <= 254 else None
         except Exception:
             return None
 
     def active(self):
         try:
-            _, _, ident = credential(keychain('gemini', 'antigravity'))
-            return next((k for k, v in self.list().items() if v['id'] == ident), None)
+            live = keychain('gemini', 'antigravity')
+            try:
+                _, _, ident = credential(live)
+                return next((k for k, v in self.list().items() if v['id'] == ident), None)
+            except QuotaError:
+                pass
+            # agy 1.4.6 rewrites the live item without the id_token on each refresh (seen 2026-10-23): it is the
+            # enrolled account whose stored copy holds the same refresh token.
+            refresh = refresh_token(live)
+            for label in self.list():
+                try:
+                    token, _, _ = self.read(label)
+                except QuotaError:
+                    continue
+                if refresh and token.get('refresh_token') == refresh:
+                    return label
+            return None
         except QuotaError:
             return None
 
@@ -210,6 +244,15 @@ class QuotaClient:
         # Installed/native OAuth clients are distributed with their registration
         # metadata. Select only the version verified against the pinned source.
         # A changed CLI fails closed; no guesses, remote code, or vendored secret.
+        if audience is None:
+            # A credential without id_token (agy 1.4.6+) names no client: take the pinned one from the agy binary.
+            try:
+                binary = self.binary.read_bytes()
+            except OSError:
+                raise QuotaError('AGY_BINARY_UNAVAILABLE') from None
+            ids = {v for v in re.findall(rb'[0-9]{6,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com', binary)
+                   if hashlib.sha256(v).hexdigest() == CLIENT_ID_HASH}
+            audience = ids.pop().decode() if len(ids) == 1 else None
         if not isinstance(audience, str) or hashlib.sha256(audience.encode()).hexdigest() != CLIENT_ID_HASH:
             raise QuotaError('OAUTH_CLIENT_UNSUPPORTED')
         if self.client_secret is None:

@@ -418,6 +418,25 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual([g['family'] for g in result], ['gemini', 'argon'])
         self.assertEqual(result[0]['windows']['5h']['remaining_percent'], 40)
 
+    def test_a_live_item_without_id_token_is_the_account_holding_its_refresh_token(self):
+        # agy 1.4.6 rewrites the live item without the id_token on each token refresh (2026-10-23)
+        import base64, quota
+        def item(d):
+            return b'go-keyring-base64:' + base64.b64encode(json.dumps(d).encode())
+        claims = base64.urlsafe_b64encode(json.dumps({'iss': 'i', 'sub': 's', 'aud': 'a'}).encode()).decode().rstrip('=')
+        stored = {'GEMINI_A': item({'id_token': f'h.{claims}.s', 'token': {'refresh_token': 'ra'}}),
+                  'GEMINI_B': item({'account_sub': 'sb', 'token': {'refresh_token': 'rb'}})}
+        live = {'value': item({'id_token_email': 'x@example.com', 'token': {'refresh_token': 'rb', 'access_token': 'n'}})}
+        ids = {k: quota.credential(v)[2] for k, v in stored.items()}
+        profiles = quota.Profiles()
+        def keychain(service, account):
+            return live['value'] if service == 'gemini' else stored[account]
+        with patch.object(quota, 'keychain', side_effect=keychain), \
+             patch.object(profiles, 'list', return_value={k: {'id': v} for k, v in ids.items()}):
+            self.assertEqual(profiles.active(), 'GEMINI_B')
+            live['value'] = item({'token': {'refresh_token': 'stranger'}})
+            self.assertIsNone(profiles.active())
+
     def test_nan_or_out_of_range_is_not_ready(self):
         for bad in (float('nan'), -1, 2, True, '0.9'):
             with self.assertRaises(QuotaError):

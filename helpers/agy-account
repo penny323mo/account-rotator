@@ -15,6 +15,7 @@ Broker model:
     never stdout, never disk. Metadata file stores labels + hashed ids only.
 """
 import argparse, base64, binascii, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import urllib.parse, urllib.request
 
 LIVE_SVC, LIVE_ACCT = "gemini", "antigravity"
 STORE_SVC = "agy-account-broker"
@@ -56,17 +57,71 @@ def decode_blob(raw):
     return json.loads(raw)
 
 
-def identity(raw):
-    """Opaque, stable account id = sha256(iss|sub) of the id_token, truncated. None if unusable."""
-    try:
-        d = decode_blob(raw)
-        if not d.get("token", {}).get("refresh_token"):
-            return None
+GOOGLE_ISS = "https://accounts.google.com"
+
+
+def encode_blob(d):
+    return "go-keyring-base64:" + base64.b64encode(json.dumps(d, separators=(",", ":")).encode()).decode()
+
+
+def own_identity(d):
+    """Id from the blob itself: the id_token (older agy), or the sub we recorded at sign-in (account_sub)."""
+    if d.get("id_token"):
         payload = d["id_token"].split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         return hashlib.sha256(f'{claims["iss"]}|{claims["sub"]}'.encode()).hexdigest()[:12]
+    if d.get("account_sub"):
+        return hashlib.sha256(f'{GOOGLE_ISS}|{d["account_sub"]}'.encode()).hexdigest()[:12]
+    return None
+
+
+def identity(raw):
+    """Opaque, stable account id = sha256(iss|sub), truncated. None if unusable.
+    agy 1.4.6 (seen 2026-10-23) rewrites the live item without the id_token on each token refresh; such a blob is
+    the enrolled account whose stored copy holds the same refresh token (a Google refresh token is one account's)."""
+    try:
+        d = decode_blob(raw)
+        refresh = d.get("token", {}).get("refresh_token")
+        if not refresh:
+            return None
+        lid = own_identity(d)
+        if lid:
+            return lid
+        for label, p in load_meta()["profiles"].items():
+            stored = decode_blob(kc_read(STORE_SVC, label) or "{}")
+            if stored.get("token", {}).get("refresh_token") == refresh and own_identity(stored) == p["id"]:
+                return p["id"]
+        return None
     except Exception:
         return None
+
+
+def for_store(raw, stored_raw):
+    """A live blob to keep under a profile: its newer token, with the stored copy's identity kept."""
+    try:
+        d = decode_blob(raw)
+        if own_identity(d):
+            return raw
+        kept = decode_blob(stored_raw)
+        for key in ("id_token", "account_sub"):
+            if kept.get(key):
+                d[key] = kept[key]
+        return encode_blob(d)
+    except Exception:
+        return raw
+
+
+def google_identity(raw):
+    """Id of a fresh sign-in that carries no id_token: ask Google whose access token it is."""
+    try:
+        d = decode_blob(raw)
+        url = "https://oauth2.googleapis.com/tokeninfo?access_token=" + urllib.parse.quote(d["token"]["access_token"])
+        with urllib.request.urlopen(url, timeout=15) as r:
+            sub = json.loads(r.read())["sub"]
+        d["account_sub"] = sub
+        return hashlib.sha256(f'{GOOGLE_ISS}|{sub}'.encode()).hexdigest()[:12], encode_blob(d)
+    except Exception:
+        return None, raw
 
 
 # ---------- metadata (labels + opaque ids only, no secrets) ----------
@@ -247,7 +302,7 @@ def _cmd_use_locked(a):
         if prev == a.label:
             target = snapshot  # Preserve the newer live token on same-profile selection.
         if prev and prev != a.label:
-            kc_write(STORE_SVC, prev, snapshot)
+            kc_write(STORE_SVC, prev, for_store(snapshot, kc_read(STORE_SVC, prev)))
         # 3. atomic single-item keychain update, 4. verify, rollback on failure
         try:
             kc_write(LIVE_SVC, LIVE_ACCT, target)
@@ -465,15 +520,18 @@ def cmd_login_finish(a):
     m = load_meta()
     prev = state.get("prev")
     prev_id = m["profiles"].get(prev, {}).get("id") if prev else None
+    before = kc_read(LIVE_SVC, LIVE_ACCT)
     tmux_send(a.code, literal=True)
     tmux_send("Enter")
     raw = None
     for _ in range(60):  # the previous account is live meanwhile; wait for agy to write the new one
         raw = kc_read(LIVE_SVC, LIVE_ACCT)
-        if identity(raw or "") not in (None, prev_id):
+        if identity(raw or "") not in (None, prev_id) or (raw and raw != before and identity(raw) is None):
             break
         time.sleep(1)
     lid = identity(raw or "")
+    if not lid and raw:
+        lid, raw = google_identity(raw)
     if not lid or lid == prev_id:
         end_login(state, "sign-in did not complete (code wrong or expired?)"
                   + (f", or that Google account is already enrolled as {prev}" if prev else ""))
@@ -629,7 +687,7 @@ def _cmd_warm_locked(a):
         after = kc_read(LIVE_SVC, LIVE_ACCT)
         if after and identity(after) == tid:
             if after != target:
-                kc_write(STORE_SVC, a.label, after)  # keep refreshed tokens
+                kc_write(STORE_SVC, a.label, for_store(after, target))  # keep refreshed tokens
             if snapshot:
                 kc_write(LIVE_SVC, LIVE_ACCT, snapshot)
             else:
