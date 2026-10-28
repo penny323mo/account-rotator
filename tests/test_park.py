@@ -44,6 +44,10 @@ class FakeIO:
     def conversation_saved(self, conversation):
         return conversation in self.saved
 
+    def kill(self, pid):
+        self.log.append(('kill', pid))
+        self.running.discard(pid)
+
     def sleep(self, seconds):
         pass
 
@@ -205,6 +209,41 @@ class ForcedSwitchTests(BrokerParkTests):
         with p, self.assertRaises(QuotaError):
             self.b.switch('B', close_all=True)
         self.assertEqual(seen, [])
+
+
+class QuitAllTests(ForcedSwitchTests):
+    """The user confirmed "自動關晒再轉" in the page: every agy goes; what can be resumed gets its command."""
+
+    def test_refusal_says_which_sessions_block_and_why(self):
+        self.io.saved = set()
+        with self.helper(), self.assertRaises(QuotaError):
+            self.b.switch('B', close_all=True)
+        self.assertEqual(self.b.blockers, [{'cwd': '/w/project', 'reason': 'PRUNED'}])
+
+    def test_pruned_conversation_is_quit_without_a_resume_command(self):
+        self.io.saved = set()
+        seen, p = self.args()
+        with p:
+            self.assertEqual(self.b.switch('B', close_all=True, quit_all=True)['selected'], 'B')
+        self.assertEqual(self.io.killed, [101])
+        self.assertTrue(self.results[0]['quit_only'])
+        self.assertNotIn('command', self.results[0])
+        self.assertIn('--force', seen[0])
+
+    def test_working_session_is_quit_and_can_be_resumed(self):
+        seen, p = self.args()
+        with patch.object(broker_mod, 'working', return_value=['child:202']), p:
+            self.b.switch('B', close_all=True, quit_all=True)
+        self.assertEqual(self.io.killed, [101])
+        self.assertIn(f'--conversation={CONV}', self.results[0]['command'])
+
+    def test_a_session_that_ignores_sigterm_is_killed(self):
+        self.io.quits = False
+        seen, p = self.args()
+        with p:
+            self.b.switch('B', close_all=True, quit_all=True)
+        self.assertIn(('kill', 101), self.io.log)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -57,6 +57,9 @@ class SystemIO:
     def terminate(self, pid):
         os.kill(pid, signal.SIGTERM)
 
+    def kill(self, pid):
+        os.kill(pid, signal.SIGKILL)
+
     def alive(self, pid):
         try:
             os.kill(pid, 0)
@@ -105,7 +108,41 @@ class Parker:
             items.append({'pid': pid, 'argv': argv, 'cwd': cwd, 'conversation': conversation})
         return items
 
-    def park(self, items, parked):
+    def plan_or_quit(self, pids):
+        """A switch where the user chose to close every agy: a session that can be resumed is (as plan()); any other
+        (working mid-turn, conversation already pruned, unreadable) is only quit."""
+        items = []
+        for pid in pids:
+            try:
+                [item] = self.plan([pid])
+            except (ParkError, OSError, ValueError, subprocess.SubprocessError):
+                try:
+                    cwd = self.io.cwd(pid)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    cwd = None
+                item = {'pid': pid, 'cwd': cwd, 'quit_only': True}
+            items.append(item)
+        return items
+
+    def blockers(self, pids, busy):
+        """[{cwd, reason}] for the sessions that keep a switch from going ahead (shown in the page's dialog)."""
+        rows = []
+        for pid in pids:
+            try:
+                cwd = self.io.cwd(pid)
+                if busy:
+                    reason = 'WORKING'
+                else:
+                    self.plan([pid])
+                    continue
+            except ParkError as e:
+                reason = 'PRUNED' if str(e) == 'AGY_CONVERSATION_NOT_SAVED' else 'UNREADABLE'
+            except (OSError, ValueError, subprocess.SubprocessError):
+                cwd, reason = None, 'UNREADABLE'
+            rows.append({'cwd': cwd, 'reason': reason})
+        return rows
+
+    def park(self, items, parked, kill=False):
         """Quit each session. Every stopped item is appended to `parked` at once, so the caller can report it even
         when a later one fails."""
         for item in items:
@@ -116,13 +153,23 @@ class Parker:
                     break
                 self.io.sleep(1)
             else:
-                raise ParkError('AGY_DID_NOT_QUIT')
+                if not kill:
+                    raise ParkError('AGY_DID_NOT_QUIT')
+                self.io.kill(item['pid'])  # the user chose to close them all: one that ignores SIGTERM goes anyway
+                for _ in range(5):
+                    if not self.io.alive(item['pid']):
+                        break
+                    self.io.sleep(1)
+                else:
+                    raise ParkError('AGY_DID_NOT_QUIT')
 
     @staticmethod
     def commands(parked):
         """Set each closed session's resume command: its own command line on its conversation (a session that never
         got a message had none: it simply starts again)."""
         for item in parked:
+            if item.get('quit_only'):
+                continue  # nothing to resume
             item['command'] = (resume_command(item['argv'], item['conversation']) if item.get('conversation')
                                else shlex.join(item['argv']))
         return parked

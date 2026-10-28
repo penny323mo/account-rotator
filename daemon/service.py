@@ -47,6 +47,9 @@ STAY_WINDOW = 15 * 60
 # Warm-up: a 5 h window only starts counting at first use, so an idle account that refilled to 100 % gets one
 # tiny prompt a minute later; its clock then runs while it waits instead of starting when it is needed.
 WARM_DELAY = 60
+# A manual switch refused by an open agy: the page offers to close them all (quit_all) in a dialog.
+AGY_BLOCKED = {'AGY_WORKING_NOT_SWITCHED', 'AGY_CONVERSATION_PRUNED_NOT_SWITCHED', 'AGY_UNREADABLE_NOT_SWITCHED',
+               'UNOWNED_AGY_NOT_SWITCHED'}
 CLAUDE_MAX_INTERVAL = 600  # Anthropic rate-limits /api/oauth/usage (shared with every Claude Code session): after
                            # an HTTP 429 poll half as often, up to this, and ease back after 10 good polls
 WARM_RETRY = 30 * 60
@@ -1637,6 +1640,9 @@ class Service:
         with self.lock:
             for item in items:
                 project = os.path.basename((item.get('cwd') or '').rstrip('/')) or item.get('cwd')
+                if item.get('quit_only'):
+                    self.event('agy_quit', project=project)
+                    continue
                 command = f"cd {shlex.quote(item['cwd'])} && {item['command']}"
                 self.event('agy_closed', project=project, command=command)
                 if self.config['notify']:
@@ -2200,7 +2206,9 @@ class Service:
             raise QuotaError('ENROLLMENT_IN_PROGRESS')
         close_all = params.get('now', False)  # a used-up target is allowed: a manual switch is the user's explicit choice
         wait_idle = params.get('wait_idle', False)
-        if type(close_all) is not bool or type(wait_idle) is not bool or (close_all and wait_idle):
+        quit_all = params.get('quit_all', False)  # confirmed in the page's dialog: close every agy, resume what can be
+        if type(close_all) is not bool or type(wait_idle) is not bool or type(quit_all) is not bool \
+                or (close_all and wait_idle) or (quit_all and not close_all):
             raise QuotaError('INVALID_NOW')
         if wait_idle:
             with self.lock:
@@ -2218,7 +2226,8 @@ class Service:
                 self.persist()
                 if self.persistence_error:
                     raise QuotaError('STATE_WRITE_FAILED_AUTOMATION_DISABLED')
-            result = self.own_agy(self.broker.switch, label, close_all=close_all, **({'force': True} if force else {}))
+            result = self.own_agy(self.broker.switch, label, close_all=close_all, **({'force': True} if force else {}),
+                                  **({'quit_all': True} if quit_all else {}))
             with self.lock:
                 self.active = result['selected']
                 self.last_switch = time.time()
@@ -2234,7 +2243,13 @@ class Service:
                 self.active = self.profiles.active()
                 self.transaction['phase'] = 'FAILED' if str(e) in NOT_SWITCHED else 'UNKNOWN'
                 self.recovery_required = self.transaction['phase'] == 'UNKNOWN'
-                self.event('switch_failed', error=str(e))
+                extra = {}
+                if str(e) in AGY_BLOCKED:
+                    rows = getattr(self.broker, 'blockers', None)
+                    extra = {'selected': label, 'blockers': [
+                        {'project': os.path.basename((b.get('cwd') or '').rstrip('/')) or '未知資料夾',
+                         'reason': b.get('reason')} for b in (rows if isinstance(rows, list) else [])]}
+                self.event('switch_failed', error=str(e), **extra)
                 self.refresh_requested.set()
             raise
         except Exception:

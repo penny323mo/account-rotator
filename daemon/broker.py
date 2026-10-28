@@ -143,6 +143,7 @@ class Broker:
         self.profiles = profiles or Profiles()
         self.helper = helper or paths.helper('agy-account')
         self.parker = parker or Parker()
+        self.blockers = []  # [{cwd, reason}] of the agy sessions that refused the last switch
         self.on_park = None  # Service: callback([(item, error)]) after paused agy sessions were resumed
 
     def warm(self, label):
@@ -153,7 +154,7 @@ class Broker:
             raise QuotaError('WARM_TIMEOUT_CHECK_CURRENT') from None
         return parse_warm(proc)
 
-    def switch(self, label, close_all=False, force=False):
+    def switch(self, label, close_all=False, force=False, quit_all=False):
         """force: the live account is used up. Sessions that cannot be paused safely (working, or no matching
         terminal) no longer block the switch; they are left running and may write the used-up account back
         later, which the rotator sees as drift and switches away from again."""
@@ -166,24 +167,34 @@ class Broker:
         if previous == label:
             return {'previous': previous, 'selected': label, 'activation': 'UNCHANGED'}
         plan = []
+        self.blockers = []
+        force = force or quit_all
         if close_all:
             try:
                 blockers = unowned_agy()
             except (OSError, subprocess.SubprocessError, ValueError):
                 blockers = []
             interactive = [pid for pid, is_print in blockers if not is_print]
-            if interactive:
+            if interactive and quit_all:
+                # The user chose to close every agy: resume what can be resumed, quit the rest (even mid-turn).
+                try:
+                    plan = self.parker.plan_or_quit(interactive)
+                except (ParkError, OSError, ValueError, subprocess.SubprocessError):
+                    raise QuotaError('UNOWNED_AGY_NOT_SWITCHED') from None
+            elif interactive:
                 # An interactive agy nobody registered would never exit by itself. If it is idle and its
                 # conversation is safely saved, quit it (any terminal) and report the command that resumes it;
                 # otherwise refuse before taking the lock so new invocations are not held up for a switch that
                 # cannot happen.  Unowned --print jobs are bounded: they get the helper's drain window.
                 busy = [r for r in working() if not r.startswith('agy_print:')]
                 if busy and not force:
+                    self.note_blockers(interactive, True)
                     raise QuotaError('AGY_WORKING_NOT_SWITCHED')  # mid-turn: never quit it
                 try:
                     plan = self.parker.plan(interactive)
                 except ParkError as e:
                     if not force:
+                        self.note_blockers(interactive, False)
                         # agy keeps only ~500 conversations: one it already pruned would be lost for good if quit
                         # (an agy left open for a day while many `agy -p` jobs run).
                         raise QuotaError('AGY_CONVERSATION_PRUNED_NOT_SWITCHED' if str(e) == 'AGY_CONVERSATION_NOT_SAVED'
@@ -201,7 +212,7 @@ class Broker:
         parked = []
         try:
             try:
-                self.parker.park(plan, parked)
+                self.parker.park(plan, parked, kill=quit_all)
             except (ParkError, OSError, ValueError, subprocess.SubprocessError):
                 raise QuotaError('UNOWNED_AGY_NOT_SWITCHED') from None
             return self._switch_locked(label, previous, close_all, force)
@@ -209,6 +220,12 @@ class Broker:
             lock.release()
             if parked and self.on_park:  # switched or not: say how to resume each closed session
                 self.on_park(self.parker.commands(parked))
+
+    def note_blockers(self, pids, busy):
+        try:
+            self.blockers = self.parker.blockers(pids, busy)
+        except (ParkError, OSError, ValueError, subprocess.SubprocessError):
+            self.blockers = []
 
     def _switch_locked(self, label, previous, close_all, force=False):
         args = [str(self.helper), '--json', 'use', label]
