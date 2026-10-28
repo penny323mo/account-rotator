@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'daemon'))
 from quota import QuotaError, QuotaClient, normalize
 import isolation  # noqa: F401  (no real Codex/agy helpers in tests)
 from service import DEFAULTS, Service, metrics, validate
-from broker import Broker, etime_seconds, running, working
+from broker import Broker, busy_sessions, etime_seconds, running, working
 
 
 def row(label, five=80, weekly=70, age=0):
@@ -536,6 +536,11 @@ class WorkingTests(unittest.TestCase):
     def test_tool_command_started_after_agy_is_work(self):
         rows = [('20', '1', '05:00', '/opt/homebrew/bin/agy'), ('30', '20', '00:40', 'sleep 40')]
         self.assertEqual(self.check(rows), ['child:30'])
+
+    def test_busy_sessions_names_the_agy_whose_tool_call_runs(self):
+        rows = [('20', '1', '05:00', '/opt/homebrew/bin/agy'), ('30', '20', '00:40', 'sleep 40'),
+                ('21', '1', '05:00', '/opt/homebrew/bin/agy')]
+        self.assertEqual(busy_sessions(rows), {20})
 
     def test_finished_child_left_as_zombie_is_idle(self):
         rows = [('20', '1', '05:00', '/opt/homebrew/bin/agy'), ('30', '20', '00:40', '<defunct>')]

@@ -15,6 +15,7 @@ import signal
 import subprocess
 import time
 
+RECENT_WRITE = 60  # as broker.RECENT_WRITE: a turn writes its conversation every few seconds
 EXIT_WAIT = 15  # seconds for agy to save and quit after SIGTERM (2 s observed)
 AGY_HOME = os.path.expanduser('~/.gemini/antigravity-cli')
 CONVERSATION = re.compile(r'(?:Created conversation|found conversation) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -44,6 +45,12 @@ class SystemIO:
 
     def conversation_saved(self, conversation):
         return os.path.exists(os.path.join(AGY_HOME, 'conversations', conversation + '.db'))
+
+    def conversation_written(self, conversation, seconds):
+        try:
+            return time.time() - os.stat(os.path.join(AGY_HOME, 'conversations', conversation + '.db')).st_mtime < seconds
+        except OSError:
+            return False
 
     def argv(self, pid):
         out = subprocess.run(['/bin/ps', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True).stdout
@@ -121,6 +128,22 @@ class Parker:
                 except (OSError, ValueError, subprocess.SubprocessError):
                     cwd = None
                 item = {'pid': pid, 'cwd': cwd, 'quit_only': True}
+            items.append(item)
+        return items
+
+    def plan_idle(self, pids, busy_pids):
+        """Used-up account: the sessions that are idle (no tool call at work, no conversation write within
+        RECENT_WRITE) and can be resumed, as plan(); every other session is left out and keeps running."""
+        items = []
+        for pid in pids:
+            if pid in busy_pids:
+                continue
+            try:
+                [item] = self.plan([pid])
+            except (ParkError, OSError, ValueError, subprocess.SubprocessError):
+                continue
+            if item['conversation'] and self.io.conversation_written(item['conversation'], RECENT_WRITE):
+                continue  # mid-turn
             items.append(item)
         return items
 

@@ -72,29 +72,46 @@ def etime_seconds(value):
     return int(days or 0) * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
-def working(rows=None, now=None, dirs=CONVERSATIONS, ignore_until=0):
-    """Work in progress, not mere presence: open-but-quiet agy / app count as idle.
-    Conversation writes up to ignore_until are the rotator's own (warm-up, switch probe), not work.
-    Returns short reasons (pids only, never argv)."""
-    if rows is None:
-        out = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,etime=,command='],
-                             capture_output=True, text=True, timeout=5).stdout
-        rows = [r for r in (line.split(None, 3) for line in out.splitlines()) if len(r) == 4]
-    now = time.time() if now is None else now
-    procs = {pid: (ppid, etime_seconds(age), cmd) for pid, ppid, age, cmd in rows}
+def ps_rows():
+    out = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,etime=,command='],
+                         capture_output=True, text=True, timeout=5).stdout
+    return [r for r in (line.split(None, 3) for line in out.splitlines()) if len(r) == 4]
+
+
+def working_children(procs):
+    """(child, parent) for each child an agy / language server started after itself: a tool call at work."""
     is_agy = lambda cmd: os.path.basename(cmd.split()[0]) == 'agy'
     is_server = lambda cmd: cmd.startswith(APP + '/Contents/Resources/bin/language_server')
-    reasons = []
     for pid, (ppid, age, cmd) in procs.items():
-        if is_agy(cmd) and any(a in PRINT_FLAGS or a.startswith(('--print=', '--prompt='))
-                               for a in cmd.split()[1:]):
-            reasons.append(f'agy_print:{pid}')
         parent = procs.get(ppid)
         if cmd == '<defunct>':  # finished child agy never reaped: not work
             continue
         if (parent and (is_agy(parent[2]) or is_server(parent[2])) and not is_server(cmd)
                 and parent[1] - age > SPAWN_GRACE):
-            reasons.append(f'child:{pid}')
+            yield pid, ppid
+
+
+def busy_sessions(rows=None):
+    """agy pids with a tool call at work (same rule as working(), per session)."""
+    rows = ps_rows() if rows is None else rows
+    procs = {int(pid): (int(ppid), etime_seconds(age), cmd) for pid, ppid, age, cmd in rows}
+    return {parent for _, parent in working_children(procs)}
+
+
+def working(rows=None, now=None, dirs=CONVERSATIONS, ignore_until=0):
+    """Work in progress, not mere presence: open-but-quiet agy / app count as idle.
+    Conversation writes up to ignore_until are the rotator's own (warm-up, switch probe), not work.
+    Returns short reasons (pids only, never argv)."""
+    rows = ps_rows() if rows is None else rows
+    now = time.time() if now is None else now
+    procs = {pid: (ppid, etime_seconds(age), cmd) for pid, ppid, age, cmd in rows}
+    is_agy = lambda cmd: os.path.basename(cmd.split()[0]) == 'agy'
+    reasons = []
+    for pid, (ppid, age, cmd) in procs.items():
+        if is_agy(cmd) and any(a in PRINT_FLAGS or a.startswith(('--print=', '--prompt='))
+                               for a in cmd.split()[1:]):
+            reasons.append(f'agy_print:{pid}')
+    reasons += [f'child:{pid}' for pid, _ in working_children(procs)]
     for d in dirs:
         try:
             latest = max((f.stat().st_mtime for f in Path(d).glob('*.db')), default=0)
@@ -190,20 +207,25 @@ class Broker:
                 if busy and not force:
                     self.note_blockers(interactive, True)
                     raise QuotaError('AGY_WORKING_NOT_SWITCHED')  # mid-turn: never quit it
-                try:
-                    plan = self.parker.plan(interactive)
-                except ParkError as e:
-                    if not force:
+                if force:
+                    # Used up: switch anyway. Each session is judged on its own: an idle one that can be resumed
+                    # is closed (its resume command reported); one mid-turn or that cannot be resumed keeps
+                    # running. Work elsewhere (another session, the app) no longer keeps the idle ones open.
+                    try:
+                        plan = self.parker.plan_idle(interactive, busy_sessions())
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        plan = []
+                else:
+                    try:
+                        plan = self.parker.plan(interactive)
+                    except ParkError as e:
                         self.note_blockers(interactive, False)
                         # agy keeps only ~500 conversations: one it already pruned would be lost for good if quit
                         # (an agy left open for a day while many `agy -p` jobs run).
                         raise QuotaError('AGY_CONVERSATION_PRUNED_NOT_SWITCHED' if str(e) == 'AGY_CONVERSATION_NOT_SAVED'
                                          else 'AGY_UNREADABLE_NOT_SWITCHED') from None
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    if not force:
+                    except (OSError, ValueError, subprocess.SubprocessError):
                         raise QuotaError('UNOWNED_AGY_NOT_SWITCHED') from None
-                if busy:
-                    plan = []  # used up: switch anyway, but still never quit a session mid-turn
         # Short-lived rotation lock (agy_ownership.RotationLock): new agy invocations wait at start only while
         # this transaction runs (acquire -> close owned -> switch -> verify -> release); never held otherwise.
         lock = RotationLock(owner='rotator')

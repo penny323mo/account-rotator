@@ -44,6 +44,9 @@ class FakeIO:
     def conversation_saved(self, conversation):
         return conversation in self.saved
 
+    def conversation_written(self, conversation, seconds):
+        return conversation in getattr(self, 'writing', ())
+
     def kill(self, pid):
         self.log.append(('kill', pid))
         self.running.discard(pid)
@@ -115,7 +118,7 @@ class BrokerParkTests(unittest.TestCase):
         self.b = broker_mod.Broker(self.tmp.name, profiles=profiles, helper='/nonexistent', parker=Parker(self.io))
         self.results = []
         self.b.on_park = self.results.extend
-        for name, value in (('unowned_agy', [(101, False)]), ('working', [])):
+        for name, value in (('unowned_agy', [(101, False)]), ('working', []), ('busy_sessions', set())):
             p = patch.object(broker_mod, name, return_value=value)
             p.start()
             self.addCleanup(p.stop)
@@ -192,10 +195,36 @@ class ForcedSwitchTests(BrokerParkTests):
 
     def test_working_session_is_not_quit_even_then(self):
         seen, p = self.args()
-        with patch.object(broker_mod, 'working', return_value=['child:202']), p:
+        with patch.object(broker_mod, 'working', return_value=['child:202']), \
+                patch.object(broker_mod, 'busy_sessions', return_value={101}), p:
             self.b.switch('B', close_all=True, force=True)
         self.assertEqual(self.io.killed, [])
         self.assertIn('--force', seen[0])
+
+    def test_session_writing_its_conversation_is_not_quit(self):
+        self.io.writing = {CONV}
+        seen, p = self.args()
+        with patch.object(broker_mod, 'working', return_value=['conversation_write']), p:
+            self.b.switch('B', close_all=True, force=True)
+        self.assertEqual(self.io.killed, [])
+
+    def test_idle_session_is_closed_while_other_work_goes_on(self):
+        # Another session or the app is at work: the idle one is still closed and reported.
+        seen, p = self.args()
+        with patch.object(broker_mod, 'working', return_value=['conversation_write', 'child:202']), p:
+            self.b.switch('B', close_all=True, force=True)
+        self.assertEqual(self.io.killed, [101])
+
+    def test_one_session_that_cannot_be_resumed_does_not_keep_the_idle_ones_open(self):
+        other = '7e1e02ed-152f-4a7f-b632-dbf216c1a01d'
+        self.io.procs[102] = (['agy'], '/w/other')
+        self.io.running.add(102)
+        self.io.conversations[102] = (True, other)  # pruned: not in saved
+        with patch.object(broker_mod, 'unowned_agy', return_value=[(102, False), (101, False)]):
+            seen, p = self.args()
+            with p:
+                self.b.switch('B', close_all=True, force=True)
+        self.assertEqual(self.io.killed, [101])
 
     def test_idle_session_is_still_closed_and_reported(self):
         seen, p = self.args()
