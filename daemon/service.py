@@ -119,7 +119,8 @@ def codex_order(rows, active, now, floor):
             continue
         five, weekly = r.get('5h') or {}, r.get('weekly') or {}
         w, wr, fr = weekly.get('remaining_percent'), reset_epoch(weekly.get('reset_at')), reset_epoch(five.get('reset_at'))
-        if five.get('remaining_percent', 0) < floor:
+        w = 100 if w is None else w  # no weekly window: no weekly limit
+        if five.get('remaining_percent', 100) < floor:
             backup.append((w, wr, fr, label))  # a 5 h window this empty cannot carry work: last resort
         elif urgent(w, wr, now):
             first.append((wr, label))
@@ -173,9 +174,14 @@ def continue_text(value):
     return text
 
 
+def reported_left(r):
+    """% left in each window the server reports. A window it does not report has no limit (ChatGPT Pro has no
+    5 h window, so a Pro account read as used up while it was being worked on)."""
+    return [v for v in ((r.get(w) or {}).get('remaining_percent') for w in ('5h', 'weekly')) if isinstance(v, (int, float))]
+
+
 def codex_exhausted(r):
-    return r.get('status') == 'OK' and (bool(r.get('limit_reached')) or any(
-        (r.get(w) or {}).get('remaining_percent', 0) <= 0 for w in ('5h', 'weekly')))
+    return r.get('status') == 'OK' and (bool(r.get('limit_reached')) or any(v <= 0 for v in reported_left(r)))
 
 
 def gemini_spent(row, family):
@@ -185,8 +191,7 @@ def gemini_spent(row, family):
 
 
 def codex_available(r):
-    return r.get('status') == 'OK' and not r.get('limit_reached') and all(
-        (r.get(w) or {}).get('remaining_percent', 0) > 0 for w in ('5h', 'weekly'))
+    return r.get('status') == 'OK' and not r.get('limit_reached') and all(v > 0 for v in reported_left(r))
 
 
 def notify_macos(message):

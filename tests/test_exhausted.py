@@ -85,3 +85,28 @@ class ExhaustedAccountTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UnreportedWindowTests(unittest.TestCase):
+    """ChatGPT Pro reports a weekly window only: a window not reported has no limit."""
+    PRO = {'status': 'OK', 'plan': 'prolite', 'limit_reached': False,
+           'weekly': {'used_percent': 63, 'remaining_percent': 37, 'reset_at': 1794475446}}
+
+    def test_weekly_only_account_with_quota_is_not_used_up(self):
+        from service import codex_exhausted, codex_available
+        self.assertFalse(codex_exhausted(self.PRO))
+        self.assertTrue(codex_available(self.PRO))
+
+    def test_weekly_only_account_with_nothing_left_is_used_up(self):
+        from service import codex_exhausted, codex_available
+        row = {**self.PRO, 'weekly': {'remaining_percent': 0, 'reset_at': 1794475446}}
+        self.assertTrue(codex_exhausted(row))
+        self.assertFalse(codex_available(row))
+
+    def test_weekly_only_account_is_an_ordinary_switch_target(self):
+        from service import codex_order
+        plus = {'status': 'OK', 'limit_reached': False, '5h': {'remaining_percent': 100, 'reset_at': 1794000000},
+                'weekly': {'remaining_percent': 37, 'reset_at': 1794475446}}
+        self.assertEqual(codex_order({'A': {**plus, 'limit_reached': True}, 'C': self.PRO}, 'A', 1793800000, 20), ['C'])
+        self.assertIn('C', codex_order({'A': plus, 'C': {**self.PRO, 'weekly': None, '5h': plus['5h']}}, 'X',
+                                       1793800000, 20))  # no weekly window: no crash, still a target
