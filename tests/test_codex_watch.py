@@ -39,6 +39,9 @@ class FakeWatchIO:
         self.released.append(target)
         self.alive = False
 
+    def last_output(self, thread):
+        return self.state.get('latest'), None
+
 
 class CodexWatchTests(unittest.TestCase):
     def setUp(self):
@@ -83,6 +86,27 @@ class CodexWatchTests(unittest.TestCase):
         self.io.state.update(stale=False, size=50, message='DONE')  # the resumed turn finished
         self.s.check_codex_watches()
         self.assertEqual((self.watch()['status'], self.watch()['summary']), ('done', 'DONE'))
+
+    def test_a_running_continue_shows_its_latest_words_and_last_write(self):
+        path = Path(self.temp.name) / 'rollout.jsonl'
+        path.write_text('{}')
+        self.io.state.update(path=str(path), latest='讀緊 RED-CLASSIFICATION.json\n\n已跑出 10 個 RED 案例')
+        self.add()
+        self.s.check_codex_watches()
+        w = self.watch()
+        self.assertEqual(w['latest'], '已跑出 10 個 RED 案例')
+        self.assertTrue(w['active_at'])
+
+    def test_stop_quits_the_cli_and_frees_the_thread(self):
+        self.add()
+        self.s.call('codex.continue.stop', {'thread': TID})
+        self.assertEqual(self.io.released, ['codex-continue:codex-01e106'])  # Esc, then Ctrl-C twice
+        self.assertEqual((self.watch()['status'], self.watch()['released']), ('stopped', True))
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_continue_stopped')
+        self.s.check_codex_watches()  # not reported again as interrupted
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_continue_stopped')
+        with self.assertRaises(QuotaError):
+            self.s.call('codex.continue.stop', {'thread': TID})
 
     def test_still_working_stays_running(self):
         self.add()

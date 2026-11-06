@@ -1738,6 +1738,7 @@ class Service:
             last, message = io.turn(path, w.get('offset', 0)) if path else (None, None)
             alive = io.cli_alive(w['thread'])
             if alive and (last not in ('task_complete', 'task_failed', 'task_error') or io.cli_busy(w['tmux'])):
+                self.codex_watch_progress(w, path)
                 continue
             if alive:
                 io.release(w['tmux'])
@@ -1747,6 +1748,8 @@ class Service:
             error = io.turn_error(path) if failed else None
             summary = next((line.strip() for line in (message or '').splitlines() if line.strip()), None)
             with self.lock:
+                if w['status'] != 'running':
+                    continue  # stopped from the page meanwhile
                 if failed:  # reported here; the error scan must not report the same stop again
                     self.session_errors[f"codex:{w['thread']}:{io.stopped_at(path)}"] = time.time()
                     self.save_session_errors()
@@ -1762,6 +1765,35 @@ class Service:
                                   f"Codex 接續出錯停咗：{w['project']}（{error or '未知錯誤'}），工作未完成。" if failed else
                                   f"Codex 接續冇回應：{w['project']}（多數係撞到額度上限），工作未完成。" if limited else
                                   f"Codex 接續中斷：{w['project']}（CLI 已結束，工作未完成）。")
+
+    def codex_watch_progress(self, w, path):
+        """What a background continue is doing, for the page: its latest words and when it last wrote (Penny could not
+        see it, nor tell working from stuck)."""
+        try:
+            text, _ = self.watch_io.last_output(w['thread'])
+            active_at = os.path.getmtime(path) if path else None
+        except Exception:  # only what the page shows: never stop the watch over it
+            return
+        latest = (text or '').strip().split('\n\n')[-1].strip()
+        with self.lock:
+            w['latest'] = latest[-240:] or None
+            w['active_at'] = datetime.fromtimestamp(active_at).astimezone().isoformat() if active_at else None
+
+    def codex_continue_stop(self, thread):
+        """Penny stops a background continue from the page: the CLI quits (the running round ends) and the thread is
+        free for the ChatGPT app and the phone again."""
+        with self.lock:
+            w = next((w for w in self.codex_watches if w['thread'] == thread and w['status'] == 'running'), None)
+            if not w:
+                raise QuotaError('THREAD_NOT_RUNNING')
+        if self.watch_io.cli_alive(thread):
+            self.watch_io.release(w['tmux'])
+        with self.lock:
+            if w['status'] == 'running':
+                w.update(status='stopped', finished_at=stamp(), released=not self.watch_io.cli_alive(thread))
+                self.save_watches()
+                self.event('codex_continue_stopped', project=w['project'], released=w['released'])
+            return self.status()
 
     def save_codex_settings(self):
         atomic_json(self.root / 'codex.json', {k: self.codex_state[k] for k in ('auto', 'autocontinue', 'waitcontinue')})
@@ -2367,6 +2399,8 @@ class Service:
             return self.agy_continue_now(params.get('text'), params.get('session'))
         if method == 'claude.continue.now':
             return self.claude_continue_now(params.get('text'), params.get('session'))
+        if method == 'codex.continue.stop':
+            return self.codex_continue_stop(params.get('thread'))
         if method == 'codex.continue.now':
             return self.codex_continue_now(params.get('session') or params.get('thread'), params.get('text'))
         if method == 'codex.waitcontinue.set':
