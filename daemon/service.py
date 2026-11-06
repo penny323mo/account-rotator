@@ -1788,6 +1788,10 @@ class Service:
                 raise QuotaError('THREAD_NOT_RUNNING')
         if self.watch_io.cli_alive(thread):
             self.watch_io.release(w['tmux'])
+            for _ in range(15):  # Codex takes a few seconds to quit after Ctrl-C
+                if not self.watch_io.cli_alive(thread):
+                    break
+                time.sleep(1)
         with self.lock:
             if w['status'] == 'running':
                 w.update(status='stopped', finished_at=stamp(), released=not self.watch_io.cli_alive(thread))

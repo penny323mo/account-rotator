@@ -251,7 +251,7 @@ document.addEventListener('click',async e=>{const b=e.target.closest('[data-code
   stopArmed=null;clearTimeout(stopTimer);b.disabled=true;if(await action('codex.continue.stop',{thread:t}))announce('已停止背景接續，對話已交返 ChatGPT app，可以喺手機繼續。');});
 function renderCodexProgress(s){const running=(s.codex_watches||[]).filter(w=>w.status==='running');
   $('codexProgressHint').textContent=running.length?`${running.length} 個對話接續中`:'';
-  const live=running.map(w=>`<li class="step live"><span class="dot"></span><div><button type="button" class="watch-stop ${stopArmed===w.thread?'armed':''}" data-codex-stop="${esc(w.thread)}">${stopArmed===w.thread?'確定停止？':'■ 停止（Esc）'}</button><b>接續中 · ${esc(w.project)}</b><small>開始 ${esc(date(w.started_at))}${w.active_at?` · 最後動作 ${esc(ago(w.active_at))}`:''} · 做完會自動釋放對話並通知</small>${w.latest?`<small class="watch-latest">${esc(w.latest)}</small>`:''}</div></li>`);
+  const live=running.map(w=>`<li class="step live"><span class="dot"></span><div><button type="button" class="watch-stop ${stopArmed===w.thread?'armed':''}" data-codex-stop="${esc(w.thread)}">${stopArmed===w.thread?'確定停止？':'■ 停止（Esc）'}</button><b>接續中 · ${esc(w.project)}</b><small>開始 ${esc(date(w.started_at))}${w.active_at?` · 最後動作 ${esc(ago(w.active_at))}`:''} · 做完會自動釋放對話並通知</small></div></li>`);
   const past=[...(s.codex_events||[])].reverse().map(e=>{const [tone,text]=codexStep(e);return `<li class="step ${tone}"><span class="dot"></span><div><b>${esc(text)}</b><small>${esc(date(e.time))}</small></div></li>`;});
   setHTML($('codexProgress'),[...live,...past].join('')||'<li class="step empty"><div><small>未有轉帳號紀錄。</small></div></li>');}
 
