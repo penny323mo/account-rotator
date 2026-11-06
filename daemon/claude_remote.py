@@ -45,6 +45,8 @@ PICKUP = 5           # seconds after touching the credentials file before re-reg
 CHANGED = 'account or organization changed'
 CREDENTIALS = os.path.expanduser('~/.claude/.credentials.json')
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
+ATTEMPTS = 3         # /remote-control tries per session: the first can land while Claude Code is still dropping the
+                     # old link ("/rc failed", the second one at once worked)
 POLL = 10
 MENU = 'Disconnect this session'
 SELECTED_DISCONNECT = re.compile(r'❯\s*Disconnect this session')
@@ -406,7 +408,7 @@ class Relinker:
 
     def relink_one(self, pid, report, stop, started):
         """One session, alongside the others: tried every poll until it is re-registered or the time limit passes."""
-        waiting = 'STILL_BUSY'
+        waiting, attempts = 'STILL_BUSY', 0
         while not stop():
             record = next((r for r in self.io.records() if r.get('pid') == pid), None)
             if record is None or not self.io.alive(pid):
@@ -420,15 +422,18 @@ class Relinker:
                     waiting = 'PROMPT_NOT_READY'
                 else:
                     before = record.get('bridgeSessionId')
-                    error = self.reregister(where, record.get('name'))
-                    if error:
-                        return report(record, None, error)
-                    after = next((r for r in self.io.records() if r.get('pid') == pid), {}).get('bridgeSessionId')
-                    if not after or after == before:
-                        return report(record, None, 'NOT_RELINKED')
-                    if self.io.owned(after) is False:
-                        return report(record, None, 'OLD_LOGIN')  # registered under the previous account
-                    return report(record, after, None)
+                    attempts += 1
+                    waiting = self.reregister(where, record.get('name'))
+                    if not waiting:
+                        after = next((r for r in self.io.records() if r.get('pid') == pid), {}).get('bridgeSessionId')
+                        if not after or after == before:
+                            waiting = 'NOT_RELINKED'
+                        elif self.io.owned(after) is False:
+                            waiting = 'OLD_LOGIN'  # registered under the previous account
+                        else:
+                            return report(record, after, None)
+                    if attempts >= ATTEMPTS:
+                        return report(record, None, waiting)
             except (OSError, ValueError, subprocess.SubprocessError):
                 # a send that failed is tried again at the next poll
                 waiting = 'TYPE_FAILED'

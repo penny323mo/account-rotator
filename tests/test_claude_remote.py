@@ -209,6 +209,21 @@ class RelinkerTests(unittest.TestCase):
         self.assertEqual(self.reports, [])
         self.assertEqual([s.link for s in self.io.sessions.values()], ['old-10', 'old-20'])
 
+    def test_a_first_remote_control_that_fails_is_tried_again(self):
+        # typed while Claude Code was still dropping the old link ("/rc failed"): the next one connected at once
+        s, orig, failed = self.io.sessions[20], self.io.sessions[20].type, []
+        s.connected = False
+        def type_once_failing(text):
+            if (s.buffer + text).startswith('/remote-control') and not failed:
+                failed.append(text)
+                s.buffer = ''
+                return
+            return orig(text)
+        s.type = type_once_failing
+        self.run_it()
+        self.assertIn(('Control room', 'new-20-1', None), self.reports)
+        self.assertEqual(len(failed), 1)
+
     def test_session_without_a_held_link_just_connects(self):
         self.io.sessions[10].connected = False
         self.run_it()
