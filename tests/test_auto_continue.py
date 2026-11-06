@@ -167,6 +167,25 @@ class ContinueNowTests(unittest.TestCase):
         self.wait()
         self.codex.continue_thread.assert_called_once()  # the same stop: not again
 
+    def test_a_thread_open_in_the_chatgpt_app_is_only_reported(self):
+        now = time.time()
+        self.error_stop(now, now - 600)
+        rollout = Path(self.temp.name) / 'rollout.jsonl'
+        rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {'originator': 'Codex Desktop'}}) + '\n')
+        self.io.rollout.return_value = rollout
+        self.io.cli_alive.return_value = False
+        self.s.notifier = Mock()
+        self.s.check_session_errors(now)
+        self.wait()
+        self.codex.continue_thread.assert_not_called()  # a CLI would take it over from the app
+        self.assertTrue(self.s.events[-1]['in_app'])
+        self.assertIn('ChatGPT app 撳 continue', self.s.notifier.call_args[0][0])
+        self.io.cli_alive.return_value = True  # a CLI already holds it: it is retried there as before
+        self.error_stop(now, now - 599)
+        self.s.check_session_errors(now + 1)
+        self.wait()
+        self.codex.continue_thread.assert_called_once()
+
     def test_nothing_is_sent_while_the_live_account_is_used_up(self):
         now = time.time()
         self.error_stop(now - 600)

@@ -228,7 +228,7 @@ const codexStep = e => ({
   codex_waiting_dropped:['info',`唔使自動接續 · ${e.project||''} 已經有人接續咗`],
   codex_continue_limited:['warn',`接續冇回應（多數係額度用盡）· ${e.project||''}`],
   codex_continue_done:['ok',`接續完成 · ${e.project||''}${e.summary?' — '+e.summary:''}`],
-  codex_continue_interrupted:['warn',`接續中斷 · ${e.project||''}`],codex_continue_error:['warn',`接續出錯停咗 · ${e.project||''}${e.error?' — '+e.error:''}`],codex_session_error:['warn',`出錯停咗，工作未完成 · ${e.project||''}${e.error?' — '+e.error:''}`],codex_errorretry:['info',`出錯 5 分鐘後自動再送 continue，等回應 · ${e.project||''}（${e.selected||''}）`],codex_errorretry_gaveup:['warn',`連續 ${e.tries||''} 次出錯，唔再自動重試 · ${e.project||''}`],
+  codex_continue_interrupted:['warn',`接續中斷 · ${e.project||''}`],codex_continue_error:['warn',`接續出錯停咗 · ${e.project||''}${e.error?' — '+e.error:''}`],codex_session_error:['warn',`出錯停咗，工作未完成${e.in_app?'（喺 ChatGPT app 撳 continue 接返）':''} · ${e.project||''}${e.error?' — '+e.error:''}`],codex_errorretry:['info',`出錯 5 分鐘後自動再送 continue，等回應 · ${e.project||''}（${e.selected||''}）`],codex_errorretry_gaveup:['warn',`連續 ${e.tries||''} 次出錯，唔再自動重試 · ${e.project||''}`],
   codex_autocontinue:['info',`自動接續：已送出 continue，等回應 · ${e.project||''}（${e.selected||''}）`],
   reset:['warn',`重設 Antigravity · 轉返 ${e.selected||''}`],
   codex_reset:['warn',`重設 Codex · 轉返 ${e.selected||''}`],

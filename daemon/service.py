@@ -781,6 +781,16 @@ class Service:
         except Exception:
             return None, None
 
+    def codex_in_app(self, thread):
+        """A thread opened in the ChatGPT app that no CLI holds now: only the app can continue it in place. A CLI
+        resume would take it over (the phone cannot reconnect to it) and closes the app."""
+        try:
+            with open(self.watch_io.rollout(thread)) as f:
+                meta = json.loads(f.readline()).get('payload') or {}
+            return meta.get('originator') == 'Codex Desktop' and not self.watch_io.cli_alive(thread)
+        except Exception:
+            return False
+
     def codex_continue_now(self, thread, text=None):
         """The user asked (from the page) to continue the thread that stopped on the limit last, on the live account."""
         text = continue_text(text)
@@ -1117,6 +1127,7 @@ class Service:
                 project = os.path.basename((t.get('cwd') or '').rstrip('/')) or t['thread'][-6:]
                 found.append((f"codex:{t['thread']}:{t['at']}", 'codex_session_error', 'Codex', t.get('name') or project,
                               t.get('error') or '', 'codex', t['thread'], t['at'], project))
+        in_app = {f[6] for f in found if self.codex_in_app(f[6])}  # notified only: continued in the app by hand
         for record, _, _ in self.relinker.sessions():
             error = self.relinker.last_error(record['sessionId'])
             if not error:
@@ -1131,12 +1142,14 @@ class Service:
                               error['text'] or error.get('error') or '', 'claude', record['sessionId'], at, record))
         with self.lock:
             new = [f for f in found if f[0] not in self.session_errors]
-            for key, kind, name, label, text, *_ in new:
+            for key, kind, name, label, text, provider, session, *_ in new:
                 self.session_errors[key] = now
-                self.event(kind, project=label, error=text[:200])
+                app = session in in_app
+                self.event(kind, project=label, error=text[:200], **({'in_app': True} if app else {}))
                 if self.config['notify']:
-                    self.notifier(f"{name} 喺 {label} 出錯停咗：{text[:120] or '未知錯誤'}。工作未完成，"
-                                  f"{ERROR_RETRY_AFTER // 60} 分鐘後會自動再送 continue。")
+                    self.notifier(f"{name} 喺 {label} 出錯停咗：{text[:120] or '未知錯誤'}。工作未完成，" +
+                                  ("請喺 ChatGPT app 撳 continue 接返。" if app else
+                                   f"{ERROR_RETRY_AFTER // 60} 分鐘後會自動再送 continue。"))
             if new or any(now - v > 2 * 86400 for v in self.session_errors.values()):
                 self.session_errors = {k: v for k, v in self.session_errors.items() if now - v <= 2 * 86400}
                 self.save_session_errors()
@@ -1144,7 +1157,7 @@ class Service:
             for k in [k for k in self.error_retries if k not in stopped]:
                 del self.error_retries[k]  # it moved on (answered, or someone typed): a later error starts again
         for key, kind, name, label, text, provider, session, at, item in found:
-            if now - at >= ERROR_RETRY_AFTER:
+            if now - at >= ERROR_RETRY_AFTER and session not in in_app:
                 self.error_retry(provider, session, key, label, item, now)
 
     def error_retry(self, provider, session, stop, label, item, now):
