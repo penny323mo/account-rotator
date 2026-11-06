@@ -344,3 +344,8 @@ header{align-items:center}.remote-dialog{width:min(420px,calc(100% - 24px));max-
 .watch-latest{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:normal!important;margin-top:3px!important;color:var(--ink)!important;opacity:.8}
 .watch-stop{margin-top:6px;min-height:32px;padding:5px 14px;border-radius:16px;font-size:12px;color:#c4321f;background:#ffffff8c;border:1px solid #ff3b3040}
 .watch-stop.armed{color:#fff;background:#e5484d;border-color:#e5484d}
+.codex-progress .step.live>div{flex-wrap:wrap;align-items:flex-start;row-gap:2px}
+.codex-progress .step.live>div>*{flex:1 1 100%;white-space:normal}
+.codex-progress .step.live>div>b{flex:1 1 0;align-self:center}
+.codex-progress .step.live .watch-stop{flex:0 0 auto;margin-top:0}
+.codex-progress .step.live .watch-latest{-webkit-line-clamp:2}
