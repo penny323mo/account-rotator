@@ -111,6 +111,28 @@ class WarmupTests(unittest.TestCase):
         self.broker.warm.assert_not_called()
         self.codex.warm.assert_not_called()
 
+    def test_a_window_seen_reset_at_its_known_time_is_warmed_at_once(self):
+        # CLAUDE_B 2026-11-10: reset 14:00, warmed 14:04:48 (slow Claude polls + a minute's wait for a second look)
+        self.s.claude_state['profiles'] = {'CLAUDE_B': {'status': 'OK', '5h': {'remaining_percent': 70,
+                                                                               'reset_at': self.now + 100},
+                                                        'weekly': {'remaining_percent': 90}}}
+        self.s.warmup_set({'provider': 'gemini', 'enabled': False})
+        self.s.warmup_set({'provider': 'codex', 'enabled': False})
+        self.run_at(0)
+        self.assertEqual(self.s.warm_refill_in(self.now), (110, 'claude'))  # the poll loop looks right after it
+        self.s.claude_state['profiles']['CLAUDE_B']['5h'] = {'remaining_percent': 100, 'reset_at': None}
+        self.s.claude = Mock()
+        self.run_at(110)
+        self.s.claude.warm.assert_called_once_with('CLAUDE_B')
+        self.assertEqual(self.s.warm_refill_in(self.now + 110), (None, None))
+
+    def test_no_early_poll_for_a_provider_with_warm_up_off(self):
+        self.s.warmup_set({'provider': 'gemini', 'enabled': False})
+        self.run_at(0)
+        self.assertEqual(self.s.warm_refill_in(self.now)[1], 'codex')
+        self.s.warmup_set({'provider': 'codex', 'enabled': False})
+        self.assertEqual(self.s.warm_refill_in(self.now), (None, None))
+
 
 def proc(code=0, out=None, err=b''):
     return Mock(returncode=code, stdout=json.dumps(out).encode() if out is not None else b'', stderr=err)

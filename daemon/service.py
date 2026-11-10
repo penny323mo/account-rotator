@@ -336,7 +336,7 @@ class Service:
             self.warmup.update({k: saved[k] for k in self.warmup if type(saved.get(k)) is bool})
         except (OSError, ValueError, AttributeError):
             pass
-        self.warm_seen, self.warm_last = {}, {}
+        self.warm_seen, self.warm_last, self.warm_resets = {}, {}, {}
         self.notifier = notifier or (lambda message: None)
         self.config_path = self.root / 'config.json'
         self.config = copy.deepcopy(DEFAULTS)
@@ -1848,7 +1848,7 @@ class Service:
                     # the live account too: idle, its clock is not running either (busy is checked before warming)
                     if (row and row.get('status') == 'OK' and wins
                             and not (isinstance(wins['weekly'][0], (int, float)) and wins['weekly'][0] <= 0)):
-                        found.append(('gemini', label, clock_idle(*wins['5h'], now)))
+                        found.append(('gemini', label, clock_idle(*wins['5h'], now), wins['5h'][1]))
             if self.warmup['codex'] and not (self.codex_state['switching'] or self.enrolling):
                 live_busy = None
                 for label, r in self.codex_state['profiles'].items():
@@ -1862,28 +1862,33 @@ class Service:
                             continue  # a turn is running on it: it is counting already
                     w = r.get('5h') or {}
                     if r.get('status') == 'OK' and (r.get('weekly') or {}).get('remaining_percent', 1) > 0:
-                        found.append(('codex', label,
-                                      clock_idle(w.get('remaining_percent'), reset_epoch(w.get('reset_at')), now)))
+                        reset = reset_epoch(w.get('reset_at'))
+                        found.append(('codex', label, clock_idle(w.get('remaining_percent'), reset, now), reset))
             if self.warmup['claude'] and not self.enrolling:
                 for label, r in self.claude_state['profiles'].items():
                     w = r.get('5h') or {}
                     if (r.get('status') == 'OK' and not r.get('stale')
                             and (r.get('weekly') or {}).get('remaining_percent', 1) > 0):
-                        found.append(('claude', label, claude_clock_idle(w.get('remaining_percent'),
-                                                                         reset_epoch(w.get('reset_at')), now)))
+                        reset = reset_epoch(w.get('reset_at'))
+                        found.append(('claude', label, claude_clock_idle(w.get('remaining_percent'), reset, now), reset))
         return found
 
     def warm_idle(self, now=None):
         """At most one warm-up per provider per poll; Gemini only while agy is idle."""
         now = time.time() if now is None else now
         done = set()
-        for provider, label, idle in self.warm_candidates(now):
+        for provider, label, idle, reset in self.warm_candidates(now):
             key = (provider, label)
             if not idle:
                 self.warm_seen.pop(key, None)
+                if isinstance(reset, (int, float)) and reset > now:
+                    self.warm_resets[key] = reset  # counting down: warm the moment this passes
                 continue
+            # a window seen resetting at its known time is a real refill: no minute's wait for a second look
+            expected = (self.warm_resets.get(key) or now + 1) <= now
             first = self.warm_seen.setdefault(key, now)
-            if provider in done or now - first < WARM_DELAY or now - self.warm_last.get(key, 0) < WARM_RETRY:
+            if (provider in done or (now - first < WARM_DELAY and not expected)
+                    or now - self.warm_last.get(key, 0) < WARM_RETRY):
                 continue
             if provider == 'gemini' and self.busy():
                 continue
@@ -1908,6 +1913,7 @@ class Service:
                     self.event(prefix + 'warm_failed', selected=label, error=str(e))
                 continue
             self.warm_last[key] = now
+            self.warm_resets.pop(key, None)
             done.add(provider)
             with self.lock:
                 self.event(prefix + 'warmed', selected=label)
@@ -2050,10 +2056,19 @@ class Service:
             self.refresh(scope)
             with self.lock:
                 delay = max(1, self.config['poll_seconds'] - (time.monotonic() - started))
-                refill = self.codex_refill_in(time.time())
-                early = refill is not None and refill < delay  # threads wait for it: look right after it resets
-            if not self.refresh_requested.wait(refill if early else delay) and early:
-                self.refresh_scope = 'codex'
+                now = time.time()
+                soon = [(s, p) for s, p in ((self.codex_refill_in(now), 'codex'), self.warm_refill_in(now))
+                        if s is not None and s < delay]  # threads wait / an idle window to start: look right after
+                wait, scope = min(soon) if soon else (delay, None)
+            if not self.refresh_requested.wait(wait) and scope:
+                self.refresh_scope = scope
+
+    def warm_refill_in(self, now, settle=10):
+        """(seconds, provider) until just after the next known 5 h reset of an account auto warm-up covers, so it
+        is seen and warmed at once instead of up to a few polls later (Claude polls slower after an HTTP 429)."""
+        due = [(reset + settle - now, provider) for (provider, _), reset in self.warm_resets.items()
+               if self.warmup.get(provider) and reset + settle > now]
+        return min(due) if due else (None, None)
 
     def codex_refill_in(self, now, settle=10):
         """Seconds until just after the live Codex account's 5 h window resets, while threads wait for quota."""
