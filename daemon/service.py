@@ -1635,6 +1635,57 @@ class Service:
             self.refresh_requested.set()
             return self.status()
 
+    def account_rename(self, params):
+        """Give an enrolled account another label (never the live one): its stored copy and what the rotator keeps
+        under the label move along; Gemini keeps its place in the rotation list and in the Gemini app."""
+        provider, label, new = params.get('provider'), params.get('label'), params.get('new')
+        pattern = self.ADD_LABEL.get(provider) if isinstance(provider, str) else None
+        if not pattern or not all(isinstance(x, str) and pattern.match(x) for x in (label, new)) or label == new:
+            raise QuotaError('INVALID_LABEL')
+        with self.lock:
+            if self.enrolling:
+                raise QuotaError('ENROLLMENT_IN_PROGRESS')
+            busy = (self.switching or self.pending if provider == 'gemini' else self.codex_state['switching']
+                    if provider == 'codex' else self.claude_state['switching'])
+            if busy:
+                raise QuotaError('SWITCH_BUSY')
+            live = {'gemini': self.active, 'codex': self.codex_state['active'], 'claude': self.claude_state['active']}[provider]
+            if label == live:
+                raise QuotaError('ACCOUNT_IN_USE')
+            known = self.rows if provider == 'gemini' else (self.codex_state if provider == 'codex' else self.claude_state)['profiles']
+            if new in known:
+                raise QuotaError('LABEL_TAKEN')
+        self.adder.rename(provider, label, new)
+        with self.lock:
+            if provider == 'gemini':
+                if label in self.rows:
+                    self.rows[new] = {**self.rows.pop(label), 'label': new}
+                if label in self.config['participants']:
+                    self.config['participants'] = [new if p == label else p for p in self.config['participants']]
+                    try:
+                        atomic_json(self.config_path, self.config)
+                    except OSError:
+                        pass
+                    self.revision += 1
+                try:  # the Gemini app's folders are mapped to labels ({"user2": "GEMINI_A"})
+                    path = self.root / 'gemini_app.json'
+                    names = json.loads(path.read_text())
+                    if label in names.values():
+                        atomic_json(path, {k: new if v == label else v for k, v in names.items()})
+                except (OSError, ValueError, AttributeError):
+                    pass
+            else:
+                profiles = (self.codex_state if provider == 'codex' else self.claude_state)['profiles']
+                if label in profiles:
+                    profiles[new] = profiles.pop(label)
+            for kept in (self.warm_seen, self.warm_last, self.warm_resets):
+                if (provider, label) in kept:
+                    kept[(provider, new)] = kept.pop((provider, label))
+            self.event('account_renamed' if provider == 'gemini' else f'{provider}_account_renamed',
+                       selected=new, previous=label)
+            self.refresh_requested.set()
+            return self.status()
+
     def check_enrollment(self):
         with self.lock:
             state = self.enrolling
@@ -2406,6 +2457,8 @@ class Service:
             return self.account_add_cancel()
         if method == 'accounts.remove':
             return self.account_remove(params)
+        if method == 'accounts.rename':
+            return self.account_rename(params)
         if method == 'codex.watch.add':
             return self.codex_watch_add(params)
         if method == 'claude.waitcontinue.set':

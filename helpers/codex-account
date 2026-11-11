@@ -743,6 +743,36 @@ def cmd_remove(a):
     out({"removed": a.label}, a.json, f"removed: {a.label}")
 
 
+def cmd_rename(a):
+    """Give an enrolled account another label (not the live one): its stored copy moves, nothing else changes."""
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: another account switch is in progress")
+        meta = load_meta()
+        if a.label not in meta["profiles"]:
+            sys.exit(f"ERROR: unknown profile {a.label}")
+        if not LABEL_RE.match(a.new) or a.new.split("_", 1)[0] != a.label.split("_", 1)[0]:
+            sys.exit(f"ERROR: new label must look like {a.label.split('_', 1)[0]}_B")
+        if a.new in meta["profiles"]:
+            sys.exit(f"ERROR: {a.new} is already enrolled")
+        if label_for(meta, identity(read_auth(live_home())[1])) == a.label:
+            sys.exit(f"ERROR: {a.label} is the live account; switch to another one first")
+        value = kc_read(a.label)
+        if not value:
+            sys.exit(f"ERROR: {a.label} has no stored copy; sign in again first")
+        kc_write(a.new, value)
+        if kc_read(a.new) != value:
+            kc_delete(a.new)
+            sys.exit(f"ERROR: could not store {a.new}")
+        meta["profiles"] = {(a.new if k == a.label else k): v for k, v in meta["profiles"].items()}
+        save_meta(meta)
+        kc_delete(a.label)
+    out({"renamed": a.label, "label": a.new}, a.json, f"renamed: {a.label} -> {a.new}")
+
+
 def available_resets(data):
     """LABEL's unused resets, the one expiring first first."""
     credits = reset_credits(data["tokens"]["access_token"], data["tokens"]["account_id"]).get("credits") or []
@@ -853,6 +883,8 @@ def main():
     pr = sp.add_parser("probe"); pr.add_argument("label", nargs="?")
     pr.add_argument("--timeout", type=int, default=120)
     rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    rn = sp.add_parser("rename", help="give an enrolled account another label (not the live one)")
+    rn.add_argument("label"); rn.add_argument("new")
     rs = sp.add_parser("reset", help="use one of the account's free usage resets (5 h + weekly start again)")
     rs.add_argument("label")
     w = sp.add_parser("warm", help="start an idle account's usage clock with one tiny prompt (live untouched)")
@@ -860,7 +892,7 @@ def main():
     a = p.parse_args()
     {"list": cmd_list, "current": cmd_current, "enroll": cmd_enroll, "login": cmd_login,
      "use": cmd_use, "quota": cmd_quota, "probe": cmd_probe, "continue": cmd_continue, "login-start": cmd_login_start,
-     "login-status": cmd_login_status, "login-cancel": cmd_login_cancel, "warm": cmd_warm, "remove": cmd_remove, "reset": cmd_reset}[a.cmd](a)
+     "login-status": cmd_login_status, "login-cancel": cmd_login_cancel, "warm": cmd_warm, "remove": cmd_remove, "rename": cmd_rename, "reset": cmd_reset}[a.cmd](a)
 
 
 if __name__ == "__main__":

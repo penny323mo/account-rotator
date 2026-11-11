@@ -443,6 +443,28 @@ class RemoveTests(WebLoginTests):
             self.remove('GEMINI_Z')
 
 
+class RenameTests(WebLoginTests):
+    def rename(self, label, new):
+        m.cmd_rename(types.SimpleNamespace(label=label, new=new, json=True))
+
+    def test_stored_copy_and_metadata_move_to_the_new_label(self):
+        copy, ident = self.store[(m.STORE_SVC, 'GEMINI_A')], m.load_meta()['profiles']['GEMINI_A']
+        self.rename('GEMINI_A', 'GEMINI_D')
+        self.assertNotIn((m.STORE_SVC, 'GEMINI_A'), self.store)
+        self.assertEqual(self.store[(m.STORE_SVC, 'GEMINI_D')], copy)
+        self.assertEqual(m.load_meta()['profiles']['GEMINI_D'], ident)
+        self.assertNotIn('GEMINI_A', m.load_meta()['profiles'])
+        self.assertEqual(self.last(), {'renamed': 'GEMINI_A', 'label': 'GEMINI_D'})
+
+    def test_live_taken_or_bad_labels_are_refused_untouched(self):
+        for label, new in (('GEMINI_C', 'GEMINI_D'), ('GEMINI_A', 'GEMINI_B'), ('GEMINI_A', 'CODEX_D'),
+                           ('GEMINI_A', 'gemini_d'), ('GEMINI_Z', 'GEMINI_D')):
+            with self.assertRaises(SystemExit):
+                self.rename(label, new)
+        self.assertEqual(sorted(m.load_meta()['profiles']), ['GEMINI_A', 'GEMINI_B', 'GEMINI_C'])
+        self.assertNotIn((m.STORE_SVC, 'GEMINI_D'), self.store)
+
+
 class LoginUrlTests(unittest.TestCase):
     def test_agy_1_2_14_blank_line_before_wrapped_url(self):
         screen = (" Your browser should open automatically. If not:                 \n\n"

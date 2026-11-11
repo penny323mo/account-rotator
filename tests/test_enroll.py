@@ -139,3 +139,44 @@ class AdderFailureTests(unittest.TestCase):
         with self.assertRaises(QuotaError) as e:
             adder.finish('claude', 'code#state')
         self.assertEqual(str(e.exception), 'WRONG_ACCOUNT')
+
+
+class RenameAccountTests(unittest.TestCase):
+    def setUp(self):
+        RemoveAccountTests.setUp(self)
+        self.s.rows = {'GEMINI_A': {'label': 'GEMINI_A', 'status': 'OK', 'groups': []},
+                       'GEMINI_C': {'label': 'GEMINI_C', 'status': 'OK', 'groups': []}}
+        self.s.config['participants'] = ['GEMINI_C', 'GEMINI_A']
+        self.adder.rename.return_value = {'renamed': 'x'}
+
+    def rename(self, provider, label, new):
+        return self.s.call('accounts.rename', {'provider': provider, 'label': label, 'new': new})
+
+    def test_gemini_keeps_its_place_in_rotation_and_in_the_gemini_app(self):
+        apps = Path(self.temp.name) / 'gemini_app.json'
+        apps.write_text(json.dumps({'user1': 'GEMINI_C', 'user2': 'GEMINI_A'}))
+        r = self.rename('gemini', 'GEMINI_A', 'GEMINI_B')
+        self.adder.rename.assert_called_once_with('gemini', 'GEMINI_A', 'GEMINI_B')
+        self.assertEqual(r['config']['participants'], ['GEMINI_C', 'GEMINI_B'])
+        self.assertEqual(self.s.rows['GEMINI_B']['label'], 'GEMINI_B')
+        self.assertNotIn('GEMINI_A', self.s.rows)
+        self.assertEqual(json.loads(apps.read_text()), {'user1': 'GEMINI_C', 'user2': 'GEMINI_B'})
+        self.assertEqual((self.s.events[-1]['kind'], self.s.events[-1]['previous']), ('account_renamed', 'GEMINI_A'))
+
+    def test_codex_numbers_move_to_the_new_label(self):
+        self.s.warm_last[('codex', 'CODEX_B')] = 5.0
+        self.rename('codex', 'CODEX_B', 'CODEX_C')
+        self.assertEqual(sorted(self.s.codex_state['profiles']), ['CODEX_A', 'CODEX_C'])
+        self.assertEqual(self.s.warm_last, {('codex', 'CODEX_C'): 5.0})
+        self.assertEqual(self.s.events[-1]['kind'], 'codex_account_renamed')
+
+    def test_live_taken_or_bad_names_are_refused_before_the_helper(self):
+        for provider, label, new, error in (('gemini', 'GEMINI_C', 'GEMINI_D', 'ACCOUNT_IN_USE'),
+                                            ('codex', 'CODEX_B', 'CODEX_A', 'LABEL_TAKEN'),
+                                            ('codex', 'CODEX_B', 'GEMINI_D', 'INVALID_LABEL'),
+                                            ('codex', 'CODEX_B', 'CODEX_B', 'INVALID_LABEL'),
+                                            ('claude', 'CLAUDE_B', 'CLAUDE_X; rm', 'INVALID_LABEL')):
+            with self.assertRaises(QuotaError) as e:
+                self.rename(provider, label, new)
+            self.assertEqual(str(e.exception), error)
+        self.adder.rename.assert_not_called()

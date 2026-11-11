@@ -622,6 +622,36 @@ def cmd_remove(a):
     out({"removed": a.label}, a.json, f"removed {a.label}")
 
 
+def cmd_rename(a):
+    """Give an enrolled account another label (not the live one): its stored copy moves, nothing else changes."""
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: another account switch is in progress")
+        meta = load_meta()
+        if a.label not in meta["profiles"]:
+            sys.exit(f"ERROR: unknown profile {a.label}")
+        if not LABEL_RE.match(a.new) or a.new.split("_", 1)[0] != a.label.split("_", 1)[0]:
+            sys.exit(f"ERROR: new label must look like {a.label.split('_', 1)[0]}_B")
+        if a.new in meta["profiles"]:
+            sys.exit(f"ERROR: {a.new} is already enrolled")
+        if live_now(meta)[1] == a.label:
+            sys.exit(f"ERROR: {a.label} is the live account; switch to another one first")
+        value = kc_read(STORE_SVC, a.label)
+        if not value:
+            sys.exit(f"ERROR: {a.label} has no stored copy; sign in again first")
+        kc_write(a.new, value)
+        if kc_read(STORE_SVC, a.new) != value:
+            kc_delete(a.new)
+            sys.exit(f"ERROR: could not store {a.new}")
+        meta["profiles"] = {(a.new if k == a.label else k): v for k, v in meta["profiles"].items()}
+        save_meta(meta)
+        kc_delete(a.label)
+    out({"renamed": a.label, "label": a.new}, a.json, f"renamed: {a.label} -> {a.new}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--json", action="store_true")
@@ -634,6 +664,8 @@ def main():
     w = sp.add_parser("warm", help="start an account's 5 h clock with one tiny prompt (live login untouched)")
     w.add_argument("label"); w.add_argument("--model", default="haiku"); w.add_argument("--timeout", type=int, default=90)
     rm = sp.add_parser("remove", help="forget an enrolled account (not the live one)"); rm.add_argument("label")
+    rn = sp.add_parser("rename", help="give an enrolled account another label (not the live one)")
+    rn.add_argument("label"); rn.add_argument("new")
     ls = sp.add_parser("login-start", help="phone sign-in: print the sign-in URL (live login untouched)")
     ls.add_argument("label")
     lf = sp.add_parser("login-finish", help="phone sign-in: paste the code shown after signing in")
@@ -641,7 +673,7 @@ def main():
     sp.add_parser("login-cancel", help="phone sign-in: stop and clean up")
     a = p.parse_args()
     {"enroll": cmd_enroll, "use": cmd_use, "list": cmd_list, "current": cmd_current, "quota": cmd_quota, "warm": cmd_warm,
-     "remove": cmd_remove, "login-start": cmd_login_start, "login-finish": cmd_login_finish,
+     "remove": cmd_remove, "rename": cmd_rename, "login-start": cmd_login_start, "login-finish": cmd_login_finish,
      "login-cancel": cmd_login_cancel}[a.cmd](a)
 
 

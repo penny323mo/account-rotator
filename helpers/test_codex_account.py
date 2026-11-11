@@ -275,6 +275,22 @@ class RemoveTests(Base):
     def test_refuses_unknown_label(self):
         with self.assertRaises(SystemExit): self.remove('CODEX_Z')
 
+    def rename(self, label, new):
+        m.cmd_rename(types.SimpleNamespace(label=label, new=new, json=True))
+
+    def test_rename_moves_stored_copy_and_metadata(self):
+        copy, ident = self.store['CODEX_B'], m.load_meta()['profiles']['CODEX_B']
+        self.rename('CODEX_B', 'CODEX_C')
+        self.assertEqual(self.deleted, ['CODEX_B'])
+        self.assertEqual(self.store['CODEX_C'], copy)
+        self.assertEqual(m.load_meta()['profiles'], {'CODEX_C': ident, 'CODEX_A': m.load_meta()['profiles']['CODEX_A']})
+
+    def test_rename_refuses_live_taken_or_bad_labels(self):
+        for label, new in (('CODEX_A', 'CODEX_C'), ('CODEX_B', 'CODEX_A'), ('CODEX_B', 'CLAUDE_C'), ('CODEX_Z', 'CODEX_C')):
+            with self.assertRaises(SystemExit): self.rename(label, new)
+        self.assertEqual(self.deleted, [])
+        self.assertNotIn('CODEX_C', self.store)
+
 
 class FakeProcs:
     """ps/pgrep/osascript stand-in plus os.kill. ChatGPT may need a few ticks to finish quitting,

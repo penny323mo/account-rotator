@@ -12,7 +12,7 @@ FAILURES = {b'already enrolled': 'ALREADY_ENROLLED', b'did not complete': 'SIGN_
             b'does not look like': 'INVALID_AUTH_CODE', b'not enrolled': 'LIVE_NOT_ENROLLED',
             b'did not show a sign-in URL': 'AGY_NO_SIGNIN_URL', b'unexpected agy login menu': 'AGY_LOGIN_SCREEN_CHANGED',
             b'is the live account': 'ACCOUNT_IN_USE', b'unknown profile': 'UNKNOWN_PROFILE',
-            b'not the account enrolled': 'WRONG_ACCOUNT'}
+            b'not the account enrolled': 'WRONG_ACCOUNT', b'switch is in progress': 'SWITCH_BUSY'}
 
 
 class AccountAdder:
@@ -44,6 +44,9 @@ class AccountAdder:
 
     def remove(self, provider, label):
         return self._run(provider, ['remove', label], 30, 'REMOVE_FAILED')
+
+    def rename(self, provider, label, new):
+        return self._run(provider, ['rename', label, new], 30, 'RENAME_FAILED')
 
     def cancel(self, provider):
         return self._run(provider, ['login-cancel'], 60, 'ADD_CANCEL_FAILED')

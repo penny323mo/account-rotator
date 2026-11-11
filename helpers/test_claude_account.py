@@ -169,6 +169,27 @@ class RemoveTests(Base):
         self.assertNotIn('CLAUDE_B', m.load_meta()['profiles'])
 
 
+class RenameTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.enroll('CLAUDE_C', creds('c'))
+        self.enroll('CLAUDE_A', creds('a'))  # A is live
+
+    def test_idle_account_gets_the_new_label(self):
+        copy, ident = self.store['CLAUDE_C'], m.load_meta()['profiles']['CLAUDE_C']
+        r = self.run_cmd(m.cmd_rename, label='CLAUDE_C', new='CLAUDE_B')
+        self.assertEqual(r, {'renamed': 'CLAUDE_C', 'label': 'CLAUDE_B'})
+        self.assertNotIn('CLAUDE_C', self.store)
+        self.assertEqual(self.store['CLAUDE_B'], copy)
+        self.assertEqual(m.load_meta()['profiles']['CLAUDE_B'], ident)
+
+    def test_live_taken_or_bad_labels_are_refused(self):
+        for label, new in (('CLAUDE_A', 'CLAUDE_B'), ('CLAUDE_C', 'CLAUDE_A'), ('CLAUDE_C', 'GEMINI_B'), ('CLAUDE_Z', 'CLAUDE_B')):
+            with self.assertRaises(SystemExit):
+                self.run_cmd(m.cmd_rename, label=label, new=new)
+        self.assertEqual(sorted(m.load_meta()['profiles']), ['CLAUDE_A', 'CLAUDE_C'])
+
+
 class LoginTests(Base):
     URL = ('https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e'
            '&response_type=code&scope=user%3Aprofile+user%3Ainference&state=S')
