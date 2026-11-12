@@ -129,6 +129,28 @@ class ClaudeServiceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual([e.get('error') for e in self.s.events if e['kind'] == 'claude_remote_failed'], ['OLD_LOGIN'])
 
+    def test_links_the_network_dropped_come_back_once_anthropic_answers(self):
+        import threading
+        runs = []
+        def run(report, before=None, stop=None):
+            runs.append(before)
+            report({'name': 'Clawbook'}, 'session_new', None)
+        self.s.relinker = Mock(run=run, drops=Mock(return_value={1: ({'sessionId': 's1', 'name': 'Clawbook'}, 5)}),
+                               io=Mock(reachable=Mock(return_value=False), sleep=Mock()))
+        self.s.claude_reconnect()
+        self.assertEqual(runs, [])                      # still refused: nothing typed
+        self.s.relinker.io.reachable.return_value = True
+        self.s.claude_reconnect()
+        for _ in range(100):
+            if not self.s.claude_relinking:
+                break
+            time.sleep(0.01)
+        self.assertEqual(runs, [{}])
+        self.assertIn(('claude_remote_relinked', 'Clawbook'), [(e['kind'], e.get('project')) for e in self.s.events])
+        self.s.claude_reconnect()                       # the same drop is tried once
+        time.sleep(0.05)
+        self.assertEqual(runs, [{}])
+
     def test_a_switch_onto_the_live_account_relinks_nothing(self):
         # 2026-10-14 12:53 重設 onto the live CLAUDE_A started a second relink that typed into the same sessions
         self.s.relinker.remote_sessions = Mock(return_value={1: {'name': 'Clawbook'}})

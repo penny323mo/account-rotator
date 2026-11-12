@@ -291,6 +291,7 @@ class Service:
         self.claude_waiting = False
         self.claude_relinking = False
         self.claude_relink_gen = 0  # a newer switch's relink supersedes the one still running
+        self.claude_reconnected = {}  # session id -> time of the dropped-link notice already acted on
         self.claude_continued = {}  # session id -> {'uuid', 'tries', 'at'}: what was already continued
         self.claude_continuing = False
         self.claude_lock = threading.Lock()
@@ -587,6 +588,10 @@ class Service:
             self.warm_idle()
         except Exception:
             pass  # warm-up is best effort; never breaks polling
+        try:
+            self.claude_reconnect()
+        except Exception:
+            pass  # best effort; never breaks polling
 
     def agy_refresh_stopped(self):
         try:
@@ -1019,7 +1024,7 @@ class Service:
             self.claude_lock.release()
             self.refresh_requested.set()
 
-    def claude_relink(self, before=None, gen=None):
+    def claude_relink(self, before=None, gen=None, why='轉 Claude 帳號後'):
         """Remote Control links belong to the old account after a switch: register them again (see claude_remote)."""
         stop = lambda: gen is not None and gen != self.claude_relink_gen
         def report(record, link, error):
@@ -1028,9 +1033,9 @@ class Service:
                 if error:
                     self.event('claude_remote_failed', project=name, error=error)
                     if self.config['notify']:
-                        self.notifier(f"轉 Claude 帳號後，{name} 重連咗遙控但仍然屬於舊帳號：要重開佢（claude --resume）先會轉"
+                        self.notifier(f"{why}，{name} 重連咗遙控但仍然屬於舊帳號：要重開佢（claude --resume）先會轉"
                                       if error == 'OLD_LOGIN' else
-                                      f"轉 Claude 帳號後，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
+                                      f"{why}，未能自動重連 {name} 嘅遙控（{error}）：請喺嗰個 session 打 /remote-control")
                 else:
                     self.event('claude_remote_relinked', project=name, summary=f'https://claude.ai/code/{link}')
         started = time.time()
@@ -1048,6 +1053,27 @@ class Service:
                 with self.lock:
                     if gen is None or gen == self.claude_relink_gen:  # a newer relink keeps the flag
                         self.claude_relinking = False
+
+    def claude_reconnect(self):
+        """Links Claude Code dropped without a switch (the network, 2026-11-12 08:07: every session gave up after a
+        network edge refused it for 3 minutes) are registered again once Anthropic answers. Each drop is tried once;
+        what fails is reported like a switch's relink."""
+        with self.lock:
+            if self.claude_state['switching'] or self.claude_relinking:
+                return
+        drops = {pid: (r, at) for pid, (r, at) in self.relinker.drops().items()
+                 if self.claude_reconnected.get(r['sessionId']) != at}
+        if not drops or not self.relinker.io.reachable():
+            return
+        with self.lock:
+            if self.claude_state['switching'] or self.claude_relinking:
+                return
+            for r, at in drops.values():
+                self.claude_reconnected[r['sessionId']] = at
+            self.claude_relinking = True
+            self.claude_relink_gen += 1
+            gen = self.claude_relink_gen
+        threading.Thread(target=self.claude_relink, args=({}, gen, '遙控斷咗線之後'), daemon=True).start()
 
     def claude_auto(self, now):
         """Claude Code sessions stopped on the usage limit get "continue" once the live account has quota again (its

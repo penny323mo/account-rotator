@@ -117,6 +117,9 @@ class InertRemoteIO:
     def alive(self, pid):
         return False
 
+    def reachable(self):
+        return False
+
     def tmux(self, *a, **k):
         raise OSError('TEST_ISOLATED')
 

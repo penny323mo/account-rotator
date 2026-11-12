@@ -43,6 +43,7 @@ def type_literal(target, text, tmux=TMUX):
                        timeout=10, check=True)
 PICKUP = 5           # seconds after touching the credentials file before re-registering
 CHANGED = 'account or organization changed'
+TAKEN_OVER = 'another connection took over'
 CREDENTIALS = os.path.expanduser('~/.claude/.credentials.json')
 LIMIT = 1800         # give up on sessions still busy after 30 minutes
 ATTEMPTS = 3         # /remote-control tries per session: the first can land while Claude Code is still dropping the
@@ -228,6 +229,16 @@ class SystemIO:
                 out.append((at, d['content']))
         return out
 
+    def reachable(self):
+        """Anthropic answers (any reply but 403: a network edge refusing is what dropped the links)."""
+        try:
+            urllib.request.urlopen(urllib.request.Request(API, method='HEAD'), timeout=10).close()
+            return True
+        except urllib.error.HTTPError as e:
+            return e.code != 403
+        except (OSError, ValueError):
+            return False
+
     def poke(self):
         """Touch ~/.claude/.credentials.json (time only, never created): every Claude Code drops its in-memory token."""
         try:
@@ -267,8 +278,14 @@ class Relinker:
                 if r.get('bridgeSessionId') and isinstance(r.get('pid'), int) and self.io.alive(r['pid'])}
 
     def dropped_sessions(self):
-        """Sessions whose link an earlier switch took away and nobody brought back: {pid: record}. Their last Remote
-        Control line is Claude Code's own account-changed notice (one the user disconnected ends otherwise)."""
+        """Sessions whose link Claude Code itself dropped and nobody brought back: {pid: record}."""
+        return {pid: r for pid, (r, _) in self.drops().items()}
+
+    def drops(self):
+        """{pid: (record, when)} for sessions whose last Remote Control line is Claude Code dropping the link on its
+        own: an account switch, or the network (2026-11-12 08:04-08:07 HKT a network edge answered 403 for 3 minutes
+        and all five sessions gave up). A link the user disconnected (/remote-control, a local-command line) or one
+        another device took over (409) is left alone."""
         out = {}
         for r in self.io.records():
             if r.get('bridgeSessionId') or r.get('kind', 'interactive') != 'interactive' \
@@ -278,8 +295,8 @@ class Relinker:
                 lines = self.io.notices(r['sessionId'])
             except OSError:
                 continue
-            if lines and CHANGED in lines[-1][1]:
-                out[r['pid']] = r
+            if lines and lines[-1][1].startswith('Remote Control disconnected') and TAKEN_OVER not in lines[-1][1]:
+                out[r['pid']] = (r, lines[-1][0])
         return out
 
     def prompt_empty(self, where):

@@ -122,6 +122,8 @@ class FakeIO:
             job()
 
 
+NET_NOTICE = ('Remote Control disconnected \u2014 Transport closed: a network edge refused the connection before it '
+              "reached Anthropic's server (HTTP 403)")
 NOTICE = 'Remote Control disconnected \u2014 signed-in claude.ai account or organization changed on this machine'
 
 
@@ -312,6 +314,20 @@ class RelinkerTests(unittest.TestCase):
         before = {20: dict(self.io.records()[1])}           # only Control room had a link at this switch
         self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err)), before)
         self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
+
+    def test_a_link_the_network_dropped_is_brought_back(self):
+        # 2026-11-12 08:07: a network edge answered 403 for 3 minutes and every session gave up its link
+        self.io.sessions[10].link, self.io.sessions[10].connected = None, False
+        self.io.lines = {10: [(5, NET_NOTICE)]}
+        self.assertEqual(self.r.drops(), {10: (dict(self.io.records()[0]), 5)})
+        self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err)), {})
+        self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
+
+    def test_a_link_another_device_took_over_stays_off(self):
+        self.io.sessions[10].link, self.io.sessions[10].connected = None, False
+        self.io.lines = {10: [(5, 'Remote Control disconnected \u2014 another connection took over this session '
+                                  '(usually another device or Claude Code session) \u2014 this device is standing down')]}
+        self.assertEqual(self.r.drops(), {})
 
     def test_a_link_disconnected_by_hand_stays_off(self):
         self.io.sessions[10].link, self.io.sessions[10].connected = None, False
