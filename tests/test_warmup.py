@@ -55,6 +55,25 @@ class WarmupTests(unittest.TestCase):
         self.assertIn(('warmed', 'B'), kinds)
         self.assertIn(('codex_warmed', 'CODEX_B'), kinds)
 
+    def test_a_plan_without_a_5h_window_is_warmed_by_its_weekly_one(self):
+        # 2026-11-12: CODEX_C (ChatGPT Pro) reports weekly only; it sat at 100 % with its week not started, never warmed
+        week = 7 * 24 * H
+        self.s.codex_state['profiles']['CODEX_B'] = codex(40, 2 * H)
+        self.s.codex_state['profiles']['CODEX_C'] = {'status': 'OK', 'active': False, '5h': None, 'weekly': {
+            'used_percent': 0, 'remaining_percent': 100, 'reset_at': time.time() + week}}
+        self.s.rows['B'] = grow('B', None, 100, weekly_reset=week)
+        self.s.rows['B']['groups'][0]['windows']['5h'] = None
+        self.run_at(0); self.run_at(WARM_DELAY + 1); self.run_at(WARM_DELAY + 2)
+        self.codex.warm.assert_called_once_with('CODEX_C')
+        self.broker.warm.assert_called_once_with('B')
+
+    def test_a_weekly_only_window_already_counting_is_left_alone(self):
+        self.s.codex_state['profiles']['CODEX_B'] = codex(40, 2 * H)
+        self.s.codex_state['profiles']['CODEX_C'] = {'status': 'OK', 'active': False, '5h': None, 'weekly': {
+            'used_percent': 0, 'remaining_percent': 100, 'reset_at': time.time() + 3 * 24 * H}}
+        self.run_at(0); self.run_at(WARM_DELAY + 1); self.run_at(WARM_DELAY + 2)
+        self.codex.warm.assert_not_called()
+
     def test_counting_accounts_and_busy_live_accounts_are_left_alone(self):
         self.s.watch_io.codex_working.return_value = ['turn:1']
         self.run_at(0); self.run_at(WARM_DELAY + 1); self.run_at(WARM_DELAY + 2)

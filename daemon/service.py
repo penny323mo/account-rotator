@@ -57,19 +57,30 @@ FIVE_HOURS = 5 * 3600
 WARM_SLACK = 180  # reset still ~5 h away (moving with "now") = clock not running
 
 
-def clock_idle(remaining, reset, now):
+WEEK = 7 * 24 * 3600
+
+
+def warm_window(five, weekly):
+    """(remaining, reset, length) of the window a warm-up starts: the 5 h one, or the weekly one on a plan that
+    reports no 5 h window (ChatGPT Pro CODEX_C 2026-11-12 was never warmed; Gemini weekly-only 2026-10-22)."""
+    if five[0] is None and weekly[0] is not None:
+        return weekly[0], weekly[1], WEEK
+    return five[0], five[1], FIVE_HOURS
+
+
+def clock_idle(remaining, reset, now, length=FIVE_HOURS):
     return (isinstance(remaining, (int, float)) and remaining >= 100 and bool(reset)
-            and reset - now >= FIVE_HOURS - WARM_SLACK)
+            and reset - now >= length - WARM_SLACK)
 
 
 def claude_transient(status):
     return status in ('HTTP_429', 'NETWORK_ERROR') or bool(re.fullmatch(r'HTTP_5\d\d', status or ''))
 
 
-def claude_clock_idle(remaining, reset, now):
-    """Claude reports no reset time while a 5 h window has not started; a full window resetting ~5 h out
+def claude_clock_idle(remaining, reset, now, length=FIVE_HOURS):
+    """Claude reports no reset time while a window has not started; a full window resetting a whole window out
     has not started counting either."""
-    return isinstance(remaining, (int, float)) and remaining >= 100 and (not reset or reset - now >= FIVE_HOURS - WARM_SLACK)
+    return isinstance(remaining, (int, float)) and remaining >= 100 and (not reset or reset - now >= length - WARM_SLACK)
 
 
 def reset_epoch(value):
@@ -129,6 +140,12 @@ def codex_order(rows, active, now, floor):
         else:
             backup.append((w, wr, fr, label))
     return [label for _, label in sorted(first)] + priority_order(normal, now) + priority_order(backup, now)
+
+
+def windows_of(row):
+    """((remaining, reset), (remaining, reset)) of a Codex / Claude row's 5 h and weekly windows; None = not reported."""
+    return tuple(((row.get(k) or {}).get('remaining_percent'), reset_epoch((row.get(k) or {}).get('reset_at')))
+                 for k in ('5h', 'weekly'))
 
 
 def gemini_windows(row, family):
@@ -1925,7 +1942,8 @@ class Service:
                     # the live account too: idle, its clock is not running either (busy is checked before warming)
                     if (row and row.get('status') == 'OK' and wins
                             and not (isinstance(wins['weekly'][0], (int, float)) and wins['weekly'][0] <= 0)):
-                        found.append(('gemini', label, clock_idle(*wins['5h'], now), wins['5h'][1]))
+                        remaining, reset, length = warm_window(wins['5h'], wins['weekly'])
+                        found.append(('gemini', label, clock_idle(remaining, reset, now, length), reset))
             if self.warmup['codex'] and not (self.codex_state['switching'] or self.enrolling):
                 live_busy = None
                 for label, r in self.codex_state['profiles'].items():
@@ -1937,17 +1955,15 @@ class Service:
                                 live_busy = True
                         if live_busy:
                             continue  # a turn is running on it: it is counting already
-                    w = r.get('5h') or {}
                     if r.get('status') == 'OK' and (r.get('weekly') or {}).get('remaining_percent', 1) > 0:
-                        reset = reset_epoch(w.get('reset_at'))
-                        found.append(('codex', label, clock_idle(w.get('remaining_percent'), reset, now), reset))
+                        remaining, reset, length = warm_window(*windows_of(r))
+                        found.append(('codex', label, clock_idle(remaining, reset, now, length), reset))
             if self.warmup['claude'] and not self.enrolling:
                 for label, r in self.claude_state['profiles'].items():
-                    w = r.get('5h') or {}
                     if (r.get('status') == 'OK' and not r.get('stale')
                             and (r.get('weekly') or {}).get('remaining_percent', 1) > 0):
-                        reset = reset_epoch(w.get('reset_at'))
-                        found.append(('claude', label, claude_clock_idle(w.get('remaining_percent'), reset, now), reset))
+                        remaining, reset, length = warm_window(*windows_of(r))
+                        found.append(('claude', label, claude_clock_idle(remaining, reset, now, length), reset))
         return found
 
     def warm_idle(self, now=None):
