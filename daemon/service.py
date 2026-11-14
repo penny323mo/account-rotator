@@ -355,6 +355,12 @@ class Service:
         except (OSError, ValueError, AttributeError):
             pass
         self.warm_seen, self.warm_last, self.warm_resets = {}, {}, {}
+        self.next_pick = {'gemini': None, 'codex': None, 'claude': None}  # Penny's choice of the next account
+        try:
+            saved = json.loads((self.root / 'next_pick.json').read_text())
+            self.next_pick.update({k: saved[k] for k in self.next_pick if isinstance(saved.get(k), str)})
+        except (OSError, ValueError, AttributeError):
+            pass
         self.notifier = notifier or (lambda message: None)
         self.config_path = self.root / 'config.json'
         self.config = copy.deepcopy(DEFAULTS)
@@ -517,12 +523,16 @@ class Service:
                     'gemini_events': copy.deepcopy([e for e in self.events if not e['kind'].startswith('codex_')][-10:]),
                     'activity': copy.deepcopy(self.activity),
                     'enrolling': copy.deepcopy(self.enrolling),
-                    'warmup': dict(self.warmup)}
+                    'warmup': dict(self.warmup), 'next_pick': dict(self.next_pick)}
 
     def ranked(self, now):
         """Rotation candidates, best first: (label, reason). Backups only when no normal account is left."""
         normal, backup = self.tiers(now)
-        return normal or backup
+        ranked = normal or backup
+        pick = next((item for item in normal + backup if item[0] == self.next_pick['gemini']), None)
+        if pick:  # Penny's pick goes first while it can take over (a backup one too)
+            ranked = [pick] + [item for item in ranked if item[0] != pick[0]]
+        return ranked
 
     def tiers(self, now):
         config, ranked, backup, first = self.config, [], [], []
@@ -560,7 +570,8 @@ class Service:
 
     def recommend_other(self, state, now):
         """The Codex / Claude account the rotator would pick next (same order as Antigravity), or None."""
-        ranked = codex_order(state['profiles'], state['active'], now, self.config['remaining_below'])
+        ranked = self.with_pick('codex' if state is self.codex_state else 'claude',
+                                codex_order(state['profiles'], state['active'], now, self.config['remaining_below']))
         return ranked[0] if ranked else None
 
     def recommend(self, now):
@@ -605,6 +616,8 @@ class Service:
             self.warm_idle()
         except Exception:
             pass  # warm-up is best effort; never breaks polling
+        with self.lock:
+            self.clear_used_picks()
         try:
             self.claude_reconnect()
         except Exception:
@@ -1447,7 +1460,8 @@ class Service:
                 refill = reset_epoch((rows[active].get('5h') or {}).get('reset_at'))
                 if state['auto'] and refill and 0 < refill - now <= STAY_WINDOW:
                     return  # live account refills within 15 min: do not close ChatGPT / Codex for that
-                candidates = codex_order(rows, active, now, self.config['remaining_below']) if state['auto'] else []
+                candidates = self.with_pick('codex', codex_order(rows, active, now, self.config['remaining_below'])) \
+                    if state['auto'] else []
                 if not candidates and not self.codex_all_exhausted:
                     self.codex_all_exhausted = True
                     self.event('codex_all_exhausted' if state['auto'] else 'codex_waiting_quota')
@@ -1724,6 +1738,9 @@ class Service:
             for kept in (self.warm_seen, self.warm_last, self.warm_resets):
                 if (provider, label) in kept:
                     kept[(provider, new)] = kept.pop((provider, label))
+            if self.next_pick.get(provider) == label:
+                self.next_pick[provider] = new
+                self.save_next_pick()
             self.event('account_renamed' if provider == 'gemini' else f'{provider}_account_renamed',
                        selected=new, previous=label)
             self.refresh_requested.set()
@@ -1921,6 +1938,47 @@ class Service:
             self.save_codex_settings()
             self.event('codex_autocontinue_changed', enabled=value)
             return self.status()
+
+    def pick_labels(self, provider):
+        return (list(self.config['participants']) if provider == 'gemini'
+                else list(self.codex_state['profiles']) if provider == 'codex' else list(self.claude_state['profiles']))
+
+    def pick_active(self, provider):
+        return (self.active if provider == 'gemini' else self.codex_state['active'] if provider == 'codex'
+                else self.claude_state['active'])
+
+    def next_pick_set(self, params):
+        """Penny picks the account the next switch goes to (label), or hands it back to the rotator (None)."""
+        provider, label = params.get('provider'), params.get('label')
+        if provider not in self.next_pick or not (label is None or isinstance(label, str)):
+            raise QuotaError('INVALID_PARAMS')
+        with self.lock:
+            if label is not None and (label not in self.pick_labels(provider) or label == self.pick_active(provider)):
+                raise QuotaError('UNKNOWN_PROFILE')
+            self.next_pick[provider] = label
+            self.save_next_pick()
+            prefix = '' if provider == 'gemini' else f'{provider}_'
+            self.event(f'{prefix}next_picked' if label else f'{prefix}next_pick_cleared', selected=label)
+            return self.status()
+
+    def save_next_pick(self):
+        atomic_json(self.root / 'next_pick.json', self.next_pick)
+
+    def with_pick(self, provider, labels):
+        """The rotator's order with Penny's pick first, when it is among the accounts that can take over."""
+        pick = self.next_pick.get(provider)
+        if pick in labels:
+            return [pick] + [x for x in labels if x != pick]
+        return labels
+
+    def clear_used_picks(self):
+        """A pick is done once that account is live (however it got there)."""
+        changed = False
+        for provider, pick in self.next_pick.items():
+            if pick and (pick == self.pick_active(provider) or pick not in self.pick_labels(provider)):
+                self.next_pick[provider], changed = None, True
+        if changed:
+            self.save_next_pick()
 
     def warmup_set(self, params):
         provider, value = params.get('provider'), params.get('enabled')
@@ -2524,6 +2582,8 @@ class Service:
             return self.codex_autocontinue_set(params.get('enabled'))
         if method == 'codex.auto.set':
             return self.codex_auto_set(params.get('enabled'))
+        if method == 'next.pick':
+            return self.next_pick_set(params)
         if method == 'warmup.set':
             return self.warmup_set(params)
         raise QuotaError('METHOD_NOT_FOUND')
