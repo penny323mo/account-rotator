@@ -303,6 +303,8 @@ def _cmd_use_locked(a):
             target = snapshot  # Preserve the newer live token on same-profile selection.
         if prev and prev != a.label:
             kc_write(STORE_SVC, prev, for_store(snapshot, kc_read(STORE_SVC, prev)))
+        if snapshot and not prev:
+            keep_unknown(snapshot)  # 重設 past a live sign-in nobody can name: never lose it outright
         # 3. atomic single-item keychain update, 4. verify, rollback on failure
         try:
             kc_write(LIVE_SVC, LIVE_ACCT, target)
@@ -610,6 +612,16 @@ def cmd_rename(a):
     out({"renamed": a.label, "label": a.new}, a.json, f"renamed: {a.label} -> {a.new}")
 
 
+def keep_unknown(raw):
+    """A copy of a live item that matches no enrolled account, before it is replaced (0600, under HOME)."""
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    path = os.path.join(HOME, time.strftime("unidentified-live-%Y%m%d-%H%M%S.json"))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(raw)
+    return path
+
+
 def cmd_current(a):
     m = load_meta()
     label, lid = live_label(m)
@@ -708,6 +720,10 @@ def _cmd_warm_locked(a):
         return
     if snapshot_id and not prev:
         sys.exit("ERROR: live account is not enrolled; enroll it first so it is not lost")
+    if snapshot and not snapshot_id:
+        # 2026-11-14 03:46: the live item could not be identified (agy 1.5.8 had refreshed it) and a warm-up of
+        # GEMINI_C went ahead; it was never put back and the live sign-in was gone by 04:14. Nothing is swapped then.
+        sys.exit("ERROR: live account cannot be identified; switch to an account first")
     kc_write(LIVE_SVC, LIVE_ACCT, target)
     try:
         if identity(kc_read(LIVE_SVC, LIVE_ACCT) or "") != tid:
@@ -715,14 +731,16 @@ def _cmd_warm_locked(a):
         res = smoke(a.timeout)
     finally:
         after = kc_read(LIVE_SVC, LIVE_ACCT)
-        if after and identity(after) == tid:
-            if after != target:
-                kc_write(STORE_SVC, a.label, for_store(after, target))  # keep refreshed tokens
+        after_id = identity(after or "")
+        if after and after_id == tid and after != target:
+            kc_write(STORE_SVC, a.label, for_store(after, target))  # keep refreshed tokens
+        if not (after_id and after_id != tid and any(p["id"] == after_id for p in m["profiles"].values())):
+            # Put the previous account back unless something (the app) already wrote another enrolled account back:
+            # a copy agy rewrote beyond recognition, or none at all, still holds the warmed account.
             if snapshot:
                 kc_write(LIVE_SVC, LIVE_ACCT, snapshot)
             else:
                 kc_delete(LIVE_SVC, LIVE_ACCT)
-        # else: something (the app) already wrote its own account back; leave it
     restored, _ = live_label(m)
     res.update({"warmed": a.label, "restored": restored, "restore_ok": restored == prev})
     out(res, a.json, f'{a.label}: warm-up {res["status"]}; live back to {restored}')

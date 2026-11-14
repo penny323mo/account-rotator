@@ -171,15 +171,17 @@ class Broker:
             raise QuotaError('WARM_TIMEOUT_CHECK_CURRENT') from None
         return parse_warm(proc)
 
-    def switch(self, label, close_all=False, force=False, quit_all=False):
-        """force: the live account is used up. Sessions that cannot be paused safely (working, or no matching
+    def switch(self, label, close_all=False, force=False, quit_all=False, recover=False):
+        """recover (重設): switch even when the live account cannot be identified - that is what 重設 is for
+        (2026-11-14 10:35 it refused twice with LIVE_IDENTITY_UNKNOWN while agy had no sign-in at all); the helper
+        keeps a copy of an unidentified live item first. force: the live account is used up. Sessions that cannot be paused safely (working, or no matching
         terminal) no longer block the switch; they are left running and may write the used-up account back
         later, which the rotator sees as drift and switches away from again."""
         if label not in self.profiles.list():
             raise QuotaError('UNKNOWN_PROFILE')
         self.profiles.read(label)  # Verify destination before interrupting processes.
         previous = self.profiles.active()
-        if previous is None:
+        if previous is None and not recover:
             raise QuotaError('LIVE_IDENTITY_UNKNOWN')
         if previous == label:
             return {'previous': previous, 'selected': label, 'activation': 'UNCHANGED'}

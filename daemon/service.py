@@ -2388,7 +2388,8 @@ class Service:
                 self.persist()
                 if self.persistence_error:
                     raise QuotaError('STATE_WRITE_FAILED_AUTOMATION_DISABLED')
-            result = self.own_agy(self.broker.switch, label, close_all=close_all, **({'force': True} if force else {}),
+            result = self.own_agy(self.broker.switch, label, close_all=close_all,
+                                  **({'force': True, 'recover': True} if force else {}),
                                   **({'quit_all': True} if quit_all else {}))
             with self.lock:
                 self.active = result['selected']

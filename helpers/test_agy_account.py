@@ -88,6 +88,20 @@ class SwitchTests(SwitchFixture):
         with self.assertRaises(OSError): self.use('GEMINI_A')
         self.run.assert_called_once_with(['open', '-a', m.APP])
 
+    def test_an_unidentified_live_item_is_kept_before_it_is_replaced(self):
+        self.store[(m.LIVE_SVC, m.LIVE_ACCT)] = ':unreadable'
+        keep = self.stack.enter_context(patch.object(m, 'keep_unknown'))
+        self.use('GEMINI_A')
+        keep.assert_called_once_with(':unreadable')
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'A:old')
+
+    def test_an_empty_live_item_is_simply_filled(self):
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        keep = self.stack.enter_context(patch.object(m, 'keep_unknown'))
+        self.use('GEMINI_A')
+        keep.assert_not_called()
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'A:old')
+
     def test_same_profile_preserves_new_live_token(self):
         self.use('GEMINI_B')
         self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:new')
@@ -177,6 +191,32 @@ class WarmTests(SwitchFixture):
         self.assertEqual(self.seen_live, ['B:new'])
         self.write.assert_not_called()
         self.assertEqual((result['warmed'], result['restored'], result['restore_ok']), ('GEMINI_B', 'GEMINI_B', True))
+
+    def test_refuses_when_live_cannot_be_identified(self):
+        # 2026-11-14 03:46: a warm-up over an unidentifiable live item lost the live sign-in
+        self.store[(m.LIVE_SVC, m.LIVE_ACCT)] = ':unreadable'
+        with self.assertRaises(SystemExit) as error: self.warm('GEMINI_A')
+        self.assertIn('cannot be identified', str(error.exception.code))
+        self.write.assert_not_called()
+        self.smoke.assert_not_called()
+
+    def test_previous_is_restored_when_agy_rewrote_the_warmed_copy_beyond_recognition(self):
+        def smoke(timeout):
+            self.store[(m.LIVE_SVC, m.LIVE_ACCT)] = ':rewritten'
+            return {'status': 'PASS', 'exit': 0, 'elapsed_s': 1.0, 'detail': None}
+        self.smoke.side_effect = smoke
+        result = self.warm('GEMINI_A')
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:new')
+        self.assertEqual(self.store[(m.STORE_SVC, 'GEMINI_A')], 'A:old')
+        self.assertTrue(result['restore_ok'])
+
+    def test_previous_is_restored_when_the_warmed_copy_vanished(self):
+        def smoke(timeout):
+            del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+            return {'status': 'PASS', 'exit': 0, 'elapsed_s': 1.0, 'detail': None}
+        self.smoke.side_effect = smoke
+        self.warm('GEMINI_A')
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:new')
 
     def test_refuses_when_live_is_not_enrolled(self):
         self.store[(m.LIVE_SVC, m.LIVE_ACCT)] = 'Z:unknown'

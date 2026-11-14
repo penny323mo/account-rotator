@@ -482,6 +482,20 @@ class BrokerTests(unittest.TestCase):
             broker.switch('B', close_all=True)
             self.assertEqual(run.call_args.args[0], ['/helper/agy-account', '--json', 'use', 'B', '--close-all'])
 
+    def test_reset_switches_even_when_the_live_account_is_unknown(self):
+        # 2026-11-14 10:35-10:36: 重設 twice refused with LIVE_IDENTITY_UNKNOWN while agy had no sign-in at all
+        profiles = Mock()
+        profiles.list.return_value = {'A': {}, 'B': {}}
+        profiles.active.side_effect = [None, 'A']
+        broker = Broker('/unused', profiles, Path('/helper/agy-account'))
+        with patch('broker.subprocess.run', return_value=Mock(returncode=0, stdout=b'{"activation":"OK","selected":"A"}')):
+            self.assertEqual(broker.switch('A', recover=True)['selected'], 'A')
+        profiles.active.side_effect = None
+        profiles.active.return_value = None
+        with self.assertRaises(QuotaError) as e:
+            broker.switch('A')  # an ordinary switch still refuses
+        self.assertEqual(str(e.exception), 'LIVE_IDENTITY_UNKNOWN')
+
     def test_helper_refusal_reason_is_kept_as_error_code(self):
         profiles = Mock()
         profiles.list.return_value = {'A': {}, 'B': {}}

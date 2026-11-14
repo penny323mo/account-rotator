@@ -36,7 +36,7 @@ class ResetTests(unittest.TestCase):
         self.s.transaction = {'phase': 'UNKNOWN', 'selected': 'B'}
         self.s.recovery_required, self.s.cancelled_until = True, 9e12
         self.s.call('provider.reset', {'provider': 'gemini'})
-        self.broker.switch.assert_called_once_with('A', close_all=True, force=True)
+        self.broker.switch.assert_called_once_with('A', close_all=True, force=True, recover=True)
         self.assertFalse(self.s.recovery_required)
         self.assertEqual(self.s.active, 'A')
         self.assertEqual(self.s.transaction['phase'], 'COMPLETE')
