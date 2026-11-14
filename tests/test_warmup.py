@@ -92,6 +92,14 @@ class WarmupTests(unittest.TestCase):
         self.codex.warm.assert_called_once_with('CODEX_A')
         self.broker.warm.assert_called_once_with('A')
 
+    def test_no_gemini_warm_up_while_nobody_is_live(self):
+        # 2026-11-14 22:04: a warm-up over an empty live item left agy signed out afterwards
+        self.s.active = None
+        self.run_at(0)
+        self.run_at(WARM_DELAY + 1)
+        self.broker.warm.assert_not_called()
+        self.codex.warm.assert_called_once_with('CODEX_B')
+
     def test_gemini_waits_while_agy_is_working(self):
         self.busy.return_value = ['agy_print:1']
         self.run_at(0); self.run_at(WARM_DELAY + 1)

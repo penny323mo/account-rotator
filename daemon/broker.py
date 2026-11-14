@@ -171,6 +171,16 @@ class Broker:
             raise QuotaError('WARM_TIMEOUT_CHECK_CURRENT') from None
         return parse_warm(proc)
 
+    def repair(self):
+        """agy (1.5.8+) deletes the Keychain item when its own write fails and signs in from a file; the helper puts
+        that sign-in back into the Keychain. Returns the adopted label, or None."""
+        try:
+            proc = subprocess.run([str(self.helper), '--json', 'repair'], capture_output=True, timeout=30)
+            result = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else {}
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return None
+        return result.get('adopted') if isinstance(result, dict) else None
+
     def switch(self, label, close_all=False, force=False, quit_all=False, recover=False):
         """recover (重設): switch even when the live account cannot be identified - that is what 重設 is for
         (2026-11-14 10:35 it refused twice with LIVE_IDENTITY_UNKNOWN while agy had no sign-in at all); the helper

@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+os.environ['AGY_LIVE_FILE'] = os.path.join(tempfile.mkdtemp(), 'antigravity-oauth-token')  # never agy's real file
 loader = importlib.machinery.SourceFileLoader('account', str(Path(__file__).with_name('agy-account')))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
@@ -222,6 +223,72 @@ class WarmTests(SwitchFixture):
         self.store[(m.LIVE_SVC, m.LIVE_ACCT)] = 'Z:unknown'
         with self.assertRaises(SystemExit): self.warm('GEMINI_A')
         self.write.assert_not_called()
+
+    def test_refuses_when_nothing_is_live(self):
+        # 2026-11-14 22:04: a warm-up over an empty item deleted it afterwards and agy was left signed out
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        with self.assertRaises(SystemExit) as error: self.warm('GEMINI_A')
+        self.assertIn('no live account', str(error.exception.code))
+        self.write.assert_not_called()
+        self.smoke.assert_not_called()
+
+    def test_agys_file_sign_in_is_adopted_and_restored(self):
+        # agy deleted the Keychain item and signs in from its file: that is the live account to put back
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        with open(m.LIVE_FILE, 'w') as f: f.write('B:file')
+        result = self.warm('GEMINI_A')
+        self.assertEqual(self.seen_live, ['A:old'])
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:file')
+        self.assertFalse(os.path.exists(m.LIVE_FILE))
+        self.assertTrue(result['restore_ok'])
+
+
+class AdoptFileTests(SwitchFixture):
+    """agy 1.5.8+ moves its sign-in to a file when its Keychain write fails and deletes the Keychain item."""
+    def tearDown(self):
+        with contextlib.suppress(FileNotFoundError): os.remove(m.LIVE_FILE)
+
+    def file(self, value):
+        with open(m.LIVE_FILE, 'w') as f: f.write(value)
+
+    def repair(self):
+        m.cmd_repair(types.SimpleNamespace(json=True))
+        return json.loads(self.output.getvalue())
+
+    def test_empty_item_gets_the_file_sign_in(self):
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        self.file('B:file')
+        self.assertEqual(self.repair(), {'adopted': 'GEMINI_B'})
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:file')
+        self.assertFalse(os.path.exists(m.LIVE_FILE))
+
+    def test_a_live_item_wins_over_a_stale_file(self):
+        self.file('A:stale')
+        self.assertEqual(self.repair(), {'adopted': None})
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'B:new')
+        self.assertTrue(os.path.exists(m.LIVE_FILE))
+
+    def test_unreadable_file_is_left_alone(self):
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        self.file(':garbage')
+        self.assertEqual(self.repair(), {'adopted': None})
+        self.write.assert_not_called()
+        self.assertTrue(os.path.exists(m.LIVE_FILE))
+
+    def test_file_is_kept_when_the_keychain_did_not_take_it(self):
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        self.file('B:file')
+        self.write.side_effect = lambda s, a, v: None  # write lost (agy wrote at the same moment)
+        self.assertEqual(self.repair(), {'adopted': None})
+        self.assertTrue(os.path.exists(m.LIVE_FILE))
+
+    def test_switch_saves_the_file_sign_in_back_to_its_account(self):
+        del self.store[(m.LIVE_SVC, m.LIVE_ACCT)]
+        self.file('B:file')
+        m.cmd_use(types.SimpleNamespace(label='GEMINI_A', close_all=True, force=False, json=True))
+        self.assertEqual(self.store[(m.LIVE_SVC, m.LIVE_ACCT)], 'A:old')
+        self.assertEqual(self.store[(m.STORE_SVC, 'GEMINI_B')], 'B:file')
+        self.assertFalse(os.path.exists(m.LIVE_FILE))
 
 
 class FakeProcs:

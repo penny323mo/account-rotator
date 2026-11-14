@@ -59,6 +59,7 @@ class InertAgyContinue:
 
 
 service.AgyContinue = InertAgyContinue
+service.Broker.repair = lambda self: None  # never the real helper (it writes the live Keychain item)
 service.AccountAdder = inert_adder
 
 

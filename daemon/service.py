@@ -746,6 +746,15 @@ class Service:
         try:
             labels = self.profiles.list()
             active = self.profiles.active()
+            if active is None and not self.switching and self.switch_lock.acquire(blocking=False):
+                try:
+                    adopted = self.broker.repair()  # agy signs in from its file (2026-11-14 21:16): adopt it
+                finally:
+                    self.switch_lock.release()
+                if adopted:
+                    active = self.profiles.active()
+                    with self.lock:
+                        self.event('live_adopted', selected=active)
             with self.lock:
                 if not self.switching:
                     if self.active and active != self.active:
@@ -2088,7 +2097,8 @@ class Service:
     def warm_candidates(self, now):
         found = []
         with self.lock:
-            if self.warmup['gemini'] and not (self.switching or self.pending or self.enrolling):
+            # nobody live (unknown): there is no account to put back after a warm-up (2026-11-14 22:04)
+            if self.warmup['gemini'] and self.active and not (self.switching or self.pending or self.enrolling):
                 for label in self.config['participants']:
                     row = self.rows.get(label)
                     wins = gemini_windows(row, self.config['family'])

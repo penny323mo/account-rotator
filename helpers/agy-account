@@ -22,6 +22,9 @@ STORE_SVC = "agy-account-broker"
 HOME = os.path.expanduser(os.environ.get("AGY_ACCOUNT_HOME", "~/.agy-account"))
 META = os.path.join(HOME, "profiles.json")
 SEC = "/usr/bin/security"
+# agy (1.5.8+) moves its sign-in here when a Keychain write fails (two of its own writes at once: exit status 45) and
+# deletes the Keychain item; it then signs in from this file while nothing is in the Keychain.
+LIVE_FILE = os.path.expanduser(os.environ.get("AGY_LIVE_FILE", "~/.gemini/antigravity-cli/antigravity-oauth-token"))
 QUOTA_MARKERS = ("RESOURCE_EXHAUSTED", "429", "quota", "Quota", "MODEL_CAPACITY_EXHAUSTED",
                  "rate limit", "exhausted")
 
@@ -248,6 +251,7 @@ def cmd_enroll(a):
 def cmd_logout_live(a):
     """Prepare enrolling another account: stash live into its profile, remove live item.
     Does NOT call agy /logout, so the enrolled refresh token is not revoked server-side."""
+    adopt_file()
     m = load_meta()
     label, lid = live_label(m)
     if lid and not label:
@@ -273,6 +277,7 @@ def cmd_use(a):
 
 
 def _cmd_use_locked(a):
+    adopt_file()
     m = load_meta()
     if a.label not in m["profiles"]:
         sys.exit(f"ERROR: unknown profile {a.label}")
@@ -477,6 +482,7 @@ def end_login(state, error=None):
 
 
 def cmd_login_start(a):
+    adopt_file()  # else agy would sign in from its file instead of asking for the new account
     m = load_meta()
     if not LABEL_RE.match(a.label) or a.label in m["profiles"]:
         sys.exit("ERROR: label must look like GEMINI_D and not be enrolled yet")
@@ -622,6 +628,47 @@ def keep_unknown(raw):
     return path
 
 
+def file_token():
+    try:
+        with open(LIVE_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def adopt_file():
+    """Put agy's file sign-in back into the empty Keychain item, so it is the live account again (seen 2026-11-14
+    21:16: agy deleted the item and kept working from the file; a warm-up then took the empty item for "nobody" and
+    the sign-in was lost). Returns the adopted label, or None when there was nothing to adopt."""
+    raw = file_token()
+    if not raw or kc_read(LIVE_SVC, LIVE_ACCT):
+        return None
+    try:
+        value = encode_blob(decode_blob(raw))
+    except Exception:
+        value = raw
+    lid = identity(value)
+    if not lid:
+        return None
+    kc_write(LIVE_SVC, LIVE_ACCT, value)
+    if identity(kc_read(LIVE_SVC, LIVE_ACCT) or "") != lid:
+        return None
+    os.remove(LIVE_FILE)  # agy reads the Keychain first; a stale file would come back if the item vanished again
+    return next((label for label, p in load_meta()["profiles"].items() if p["id"] == lid), lid)
+
+
+def cmd_repair(a):
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    with open(os.path.join(HOME, "switch.lock"), "a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("ERROR: BUSY another account switch is in progress")
+        adopted = adopt_file()
+    out({"adopted": adopted}, a.json, f"adopted agy's file sign-in: {adopted}" if adopted else "nothing to adopt")
+
+
 def cmd_current(a):
     m = load_meta()
     label, lid = live_label(m)
@@ -698,6 +745,7 @@ def cmd_warm(a):
 def _cmd_warm_locked(a):
     """Start an idle account's quota clock: make it live for one tiny `agy -p`, then restore (live: in place).
     Antigravity.app may stay open (it only reads the item at startup); a running agy CLI may not."""
+    adopt_file()
     m = load_meta()
     if a.label not in m["profiles"]:
         sys.exit(f"ERROR: unknown profile {a.label}")
@@ -724,6 +772,9 @@ def _cmd_warm_locked(a):
         # 2026-11-14 03:46: the live item could not be identified (agy 1.5.8 had refreshed it) and a warm-up of
         # GEMINI_C went ahead; it was never put back and the live sign-in was gone by 04:14. Nothing is swapped then.
         sys.exit("ERROR: live account cannot be identified; switch to an account first")
+    if not snapshot:
+        # Nobody to put back afterwards: the warm-up would leave agy signed out (2026-11-14 22:04).
+        sys.exit("ERROR: no live account; switch to an account first")
     kc_write(LIVE_SVC, LIVE_ACCT, target)
     try:
         if identity(kc_read(LIVE_SVC, LIVE_ACCT) or "") != tid:
@@ -770,10 +821,11 @@ def main():
     pr.add_argument("--timeout", type=int, default=90)
     w = sp.add_parser("warm", help="start an idle account's quota clock with one tiny prompt, then restore")
     w.add_argument("label"); w.add_argument("--timeout", type=int, default=60)
+    sp.add_parser("repair", help="put agy's file sign-in back into the empty Keychain item")
     a = p.parse_args()
     {"list": cmd_list, "status": cmd_list, "current": cmd_current, "enroll": cmd_enroll,
      "logout-live": cmd_logout_live, "use": cmd_use, "probe": cmd_probe, "login-start": cmd_login_start,
-     "login-finish": cmd_login_finish, "login-cancel": cmd_login_cancel, "remove": cmd_remove, "rename": cmd_rename, "warm": cmd_warm}[a.cmd](a)
+     "login-finish": cmd_login_finish, "login-cancel": cmd_login_cancel, "remove": cmd_remove, "rename": cmd_rename, "warm": cmd_warm, "repair": cmd_repair}[a.cmd](a)
 
 
 if __name__ == "__main__":

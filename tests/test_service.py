@@ -219,6 +219,19 @@ class ServiceTests(unittest.TestCase):
             self.s.configure({'revision': self.s.revision, 'config': invalid})
         self.assertEqual(before, self.s.config_path.read_bytes())
 
+    def test_agys_file_sign_in_is_adopted_when_nobody_is_live(self):
+        # 2026-11-14 21:16: agy deleted the Keychain item after its own write failed and signed in from a file
+        self.profiles.active.side_effect = [None, 'A']
+        self.broker.repair.return_value = 'A'
+        self.s._refresh_gemini()
+        self.broker.repair.assert_called_once_with()
+        self.assertEqual(self.s.active, 'A')
+        self.assertIn(('live_adopted', 'A'), [(e['kind'], e.get('selected')) for e in self.s.events])
+
+    def test_a_known_live_account_is_not_repaired(self):
+        self.s._refresh_gemini()
+        self.broker.repair.assert_not_called()
+
     def test_drift_cancels_automatic_switch(self):
         self.s.set_enabled(True)
         self.profiles.active.return_value = 'C'
