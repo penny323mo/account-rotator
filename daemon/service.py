@@ -162,6 +162,7 @@ def why(label, usable, weekly, weekly_reset, now):
     return f"{label}：可用 {usable:.0f}%，每週剩 {weekly:.0f}%{when}"
 
 
+SCHEDULE_GRACE = 30 * 60  # a scheduled switch that keeps finding a switch in progress gives up after this
 CODEX_COOLDOWN = 600  # seconds between Codex switches, so stale numbers cannot ping-pong accounts
 CLAUDE_CONTINUE_GAP = 15 * 60  # a session that stops on the limit again is retried no sooner than this
 CLAUDE_CONTINUE_TRIES = 3      # ... and at most this often until it gets past the limit
@@ -355,6 +356,14 @@ class Service:
         except (OSError, ValueError, AttributeError):
             pass
         self.warm_seen, self.warm_last, self.warm_resets = {}, {}, {}
+        self.schedules = []  # [{id, provider, label, at}]: switches Penny set for a given time, earliest first
+        try:
+            saved = json.loads((self.root / 'schedules.json').read_text())
+            self.schedules = [x for x in saved if isinstance(x, dict) and x.get('provider') in ('gemini', 'codex', 'claude')
+                              and isinstance(x.get('label'), str) and isinstance(x.get('at'), (int, float))
+                              and isinstance(x.get('id'), str)]
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
         self.next_pick = {'gemini': None, 'codex': None, 'claude': None}  # Penny's choice of the next account
         try:
             saved = json.loads((self.root / 'next_pick.json').read_text())
@@ -523,7 +532,8 @@ class Service:
                     'gemini_events': copy.deepcopy([e for e in self.events if not e['kind'].startswith('codex_')][-10:]),
                     'activity': copy.deepcopy(self.activity),
                     'enrolling': copy.deepcopy(self.enrolling),
-                    'warmup': dict(self.warmup), 'next_pick': dict(self.next_pick)}
+                    'warmup': dict(self.warmup), 'next_pick': dict(self.next_pick),
+                    'schedules': copy.deepcopy(self.schedules)}
 
     def ranked(self, now):
         """Rotation candidates, best first: (label, reason). Backups only when no normal account is left."""
@@ -616,6 +626,10 @@ class Service:
             self.warm_idle()
         except Exception:
             pass  # warm-up is best effort; never breaks polling
+        try:
+            self.run_schedules()
+        except Exception:
+            pass  # never breaks polling
         with self.lock:
             self.clear_used_picks()
         try:
@@ -1488,8 +1502,13 @@ class Service:
                             self.codex_waiting.append({**item, 'size': size})
                     self.save_waiting()
             return
+        self.codex_switch_continuing(candidates[0], 'automatic')
+
+    def codex_switch_continuing(self, target, source):
+        """Switch Codex like the automatic switch does: note interrupted threads, switch, continue them, make sure
+        ChatGPT is open again. Returns the switch error (it is also recorded as codex_switch_failed), or None."""
         with self.lock:
-            target = candidates[0]
+            state = self.codex_state
             autocontinue, waitcontinue = state['autocontinue'], state['waitcontinue']
         # Capture interrupted threads before the switch closes ChatGPT / Codex CLI.
         try:
@@ -1508,9 +1527,9 @@ class Service:
                 self.save_waiting()
             captured += [w for w in waiting if w['thread'] not in {c['thread'] for c in captured}]
         try:
-            self.codex_use({'label': target}, source='automatic')
-        except QuotaError:
-            return  # Recorded as codex_switch_failed; the cooldown stops retrying every poll.
+            self.codex_use({'label': target}, source=source)
+        except QuotaError as e:
+            return str(e)  # Recorded as codex_switch_failed; the cooldown stops retrying every poll.
         for item in captured:
             project = os.path.basename((item.get('cwd') or '').rstrip('/')) or item['thread'][-6:]
             try:
@@ -1521,6 +1540,7 @@ class Service:
                 with self.lock:
                     self.event('codex_autocontinue_failed', project=project, error=str(e))
         self.codex_app_safety_net(app_was_running)
+        return None
 
     def still_stopped(self, items):
         """Waiting threads nobody continued meanwhile: no new turn since they were noted, or only one that ended on the
@@ -1939,6 +1959,81 @@ class Service:
             self.event('codex_autocontinue_changed', enabled=value)
             return self.status()
 
+    def schedule_add(self, params):
+        """Switch `provider` to `label` at `at` (epoch seconds); several can be queued."""
+        provider, label, at = params.get('provider'), params.get('label'), params.get('at')
+        if provider not in ('gemini', 'codex', 'claude') or not isinstance(label, str) \
+                or type(at) not in (int, float) or not (time.time() - 60 < at < time.time() + 8 * 24 * 3600):
+            raise QuotaError('INVALID_PARAMS')
+        with self.lock:
+            if label not in self.pick_labels(provider):
+                raise QuotaError('UNKNOWN_PROFILE')
+            if len(self.schedules) >= 20:
+                raise QuotaError('TOO_MANY_SCHEDULES')
+            item = {'id': os.urandom(6).hex(), 'provider': provider, 'label': label, 'at': float(at)}
+            self.schedules = sorted(self.schedules + [item], key=lambda x: x['at'])
+            self.save_schedules()
+            self.event(self.schedule_kind(provider, 'added'), selected=label, at=item['at'])
+            self.refresh_requested.set()  # the poll loop looks at the new time
+            return self.status()
+
+    def schedule_remove(self, params):
+        with self.lock:
+            item = next((x for x in self.schedules if x['id'] == params.get('id')), None)
+            if not item:
+                raise QuotaError('SCHEDULE_GONE')
+            self.schedules.remove(item)
+            self.save_schedules()
+            self.event(self.schedule_kind(item['provider'], 'removed'), selected=item['label'], at=item['at'])
+            return self.status()
+
+    @staticmethod
+    def schedule_kind(provider, what):
+        return f"{'' if provider == 'gemini' else provider + '_'}schedule_{what}"
+
+    def save_schedules(self):
+        atomic_json(self.root / 'schedules.json', self.schedules)
+
+    def schedule_due_in(self, now, settle=1):
+        """Seconds until the next scheduled switch (the poll loop wakes for it), or None."""
+        with self.lock:
+            return max(0, self.schedules[0]['at'] - now + settle) if self.schedules else None
+
+    def run_schedules(self, now=None):
+        """Carry out the switches whose time has come, one per provider per poll. A busy switch is tried again next
+        poll (for up to SCHEDULE_GRACE); any other failure is reported and the item dropped. Codex goes like an
+        automatic switch (interrupted threads get "continue"); Antigravity waits until agy is idle (等閒置先轉)."""
+        now = time.time() if now is None else now
+        with self.lock:
+            due = [x for x in self.schedules if x['at'] <= now]
+        done = set()
+        for item in due:
+            if item['provider'] in done:
+                continue
+            done.add(item['provider'])
+            error = None
+            try:
+                with self.lock:
+                    live = self.pick_active(item['provider'])
+                if item['label'] == live:
+                    pass  # already there
+                elif item['provider'] == 'codex':
+                    error = self.codex_switch_continuing(item['label'], 'scheduled')
+                elif item['provider'] == 'claude':
+                    self.claude_use({'label': item['label']}, source='scheduled')
+                else:
+                    self.manual_use({'label': item['label'], 'wait_idle': True})
+            except QuotaError as e:
+                error = str(e)
+            with self.lock:
+                if error == 'SWITCH_BUSY' and now - item['at'] < SCHEDULE_GRACE:
+                    continue
+                if item in self.schedules:
+                    self.schedules.remove(item)
+                    self.save_schedules()
+                self.event(self.schedule_kind(item['provider'], 'failed' if error else 'done'),
+                           selected=item['label'], **({'error': error} if error else {}))
+
     def pick_labels(self, provider):
         return (list(self.config['participants']) if provider == 'gemini'
                 else list(self.codex_state['profiles']) if provider == 'codex' else list(self.claude_state['profiles']))
@@ -2208,7 +2303,8 @@ class Service:
             with self.lock:
                 delay = max(1, self.config['poll_seconds'] - (time.monotonic() - started))
                 now = time.time()
-                soon = [(s, p) for s, p in ((self.codex_refill_in(now), 'codex'), self.warm_refill_in(now))
+                soon = [(s, p) for s, p in ((self.codex_refill_in(now), 'codex'), self.warm_refill_in(now),
+                                            (self.schedule_due_in(now), 'schedule'))
                         if s is not None and s < delay]  # threads wait / an idle window to start: look right after
                 wait, scope = min(soon) if soon else (delay, None)
             if not self.refresh_requested.wait(wait) and scope:
@@ -2582,6 +2678,10 @@ class Service:
             return self.codex_autocontinue_set(params.get('enabled'))
         if method == 'codex.auto.set':
             return self.codex_auto_set(params.get('enabled'))
+        if method == 'schedule.add':
+            return self.schedule_add(params)
+        if method == 'schedule.remove':
+            return self.schedule_remove(params)
         if method == 'next.pick':
             return self.next_pick_set(params)
         if method == 'warmup.set':
