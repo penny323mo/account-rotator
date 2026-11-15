@@ -52,6 +52,9 @@ POLL = 10
 MENU = 'Disconnect this session'
 SELECTED_DISCONNECT = re.compile(r'❯\s*Disconnect this session')
 EMPTY_PROMPT = re.compile(r'^\s*❯[\s\u00a0]*$', re.M)  # the input line with nothing typed (a menu row has text)
+# Claude Code's own suggestion dialogs over the input box ("We recommend compacting earlier ... esc not now": a session's
+# link never came back behind it). Esc only means "not now".
+NOTICE = re.compile(r'esc not now')
 PROJECTS = os.path.expanduser('~/.claude/projects')
 DIM = re.compile(r'\x1b\[2m.*?(?:\x1b\[(?:0|22)?m|$)', re.M)
 ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
@@ -302,6 +305,10 @@ class Relinker:
     def prompt_empty(self, where):
         """Its input line holds nothing: a draft is never sent along with /remote-control."""
         screen = self.io.typed_screen(where)
+        if NOTICE.search('\n'.join(screen.rstrip().splitlines()[-14:])):
+            self.send(where, 'esc')
+            self.io.sleep(1)
+            screen = self.io.typed_screen(where)
         return bool(EMPTY_PROMPT.search('\n'.join(screen.rstrip().splitlines()[-14:])))
 
     def terminal(self, record):

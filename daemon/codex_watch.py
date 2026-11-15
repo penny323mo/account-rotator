@@ -118,12 +118,32 @@ class WatchIO:
                 if meta.get('parent_thread_id') or not meta.get('id'):
                     continue
                 last, message = self.turn(path)
-                if not (last == 'task_started' or (last in ('task_complete', 'task_failed') and not message and age <= quiet_end)):
+                ended = last in ('task_complete', 'task_failed') and not message
+                # Codex also ends a turn on the usage limit as turn_aborted (2026-11-15 20:54, weekly at 100 %)
+                ended = ended or (last == 'turn_aborted' and self.limit_hit(path))
+                if not (last == 'task_started' or (ended and age <= quiet_end)):
                     continue
                 found.append({'thread': meta['id'], 'cwd': meta.get('cwd'), 'model': self.thread_model(path)})
             except (OSError, ValueError):
                 continue
         return found
+
+    def limit_hit(self, path):
+        """The thread's last rate-limit report shows a window used up."""
+        with open(path, 'rb') as f:
+            f.seek(max(0, os.path.getsize(path) - 256 * 1024))
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            if b'"rate_limits"' not in line:
+                continue
+            try:
+                limits = ((json.loads(line).get('payload') or {}).get('rate_limits')) or {}
+            except ValueError:
+                continue
+            windows = [limits.get(k) or {} for k in ('primary', 'secondary')]
+            return bool(limits.get('rate_limit_reached_type')) or any(
+                isinstance(w.get('used_percent'), (int, float)) and w['used_percent'] >= 100 for w in windows)
+        return False
 
     def thread_names(self):
         """{thread id: its title} from Codex's session_index.jsonl (the names ChatGPT lists), latest entry wins."""

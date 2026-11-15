@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'daemon'))
 from codex import CodexAccounts
 from quota import QuotaError
 import isolation  # noqa: F401  (no real Codex/agy helpers in tests)
-from service import Service
+from service import Service, codex_refill
 from test_service import row
 
 QUOTA = {'profiles': {
@@ -169,6 +169,26 @@ def window(remaining):
 def codex_row(five=80, weekly=80, status='OK', limit=False, active=False):
     return {'status': status, 'plan': 'plus', 'limit_reached': limit, 'active': active,
             '5h': window(five), 'weekly': window(weekly)} if status == 'OK' else {'status': status, 'active': active}
+
+
+class CodexRefillTests(unittest.TestCase):
+    """When the live account can work again decides whether the rotator waits instead of switching."""
+    def row(self, five, weekly):
+        return {'status': 'OK', '5h': {'remaining_percent': five, 'reset_at': 1000},
+                'weekly': {'remaining_percent': weekly, 'reset_at': 900000}}
+
+    def test_used_up_week_is_not_helped_by_the_5h_reset(self):
+        # 2026-11-15 20:54: CODEX_A at 100 % weekly waited for its 5 h reset 10 min away
+        self.assertEqual(codex_refill(self.row(45, 0)), 900000)
+
+    def test_used_up_5h_window_refills_at_its_reset(self):
+        self.assertEqual(codex_refill(self.row(0, 50)), 1000)
+
+    def test_both_used_up_means_the_later_reset(self):
+        self.assertEqual(codex_refill(self.row(0, 0)), 900000)
+
+    def test_only_limit_reached_falls_back_to_the_5h_reset(self):
+        self.assertEqual(codex_refill({**self.row(30, 30), 'limit_reached': True}), 1000)
 
 
 class CodexAutoTests(unittest.TestCase):

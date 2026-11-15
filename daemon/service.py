@@ -208,6 +208,16 @@ def gemini_spent(row, family):
     return bool(wins) and any(isinstance(v, (int, float)) and v <= 0 for v, _ in wins.values())
 
 
+def codex_refill(r):
+    """When a used-up account can work again: the latest reset among its used-up windows. A 5 h reset does not help a
+    used-up week (2026-11-15 20:54 CODEX_A at 100 % weekly waited 10 min for its 5 h reset; what stopped was never
+    continued). Only limit_reached reported: the 5 h reset, as before."""
+    spent = [w for w in ('5h', 'weekly')
+             if isinstance((r.get(w) or {}).get('remaining_percent'), (int, float)) and r[w]['remaining_percent'] <= 0]
+    resets = [reset_epoch((r.get(w) or {}).get('reset_at')) for w in (spent or ['5h'])]
+    return None if None in resets else max(resets)
+
+
 def codex_available(r):
     return r.get('status') == 'OK' and not r.get('limit_reached') and all(v > 0 for v in reported_left(r))
 
@@ -1480,7 +1490,7 @@ class Service:
                     waiting, self.codex_waiting = self.codex_waiting, []
                     self.save_waiting()
             else:
-                refill = reset_epoch((rows[active].get('5h') or {}).get('reset_at'))
+                refill = codex_refill(rows[active])
                 if state['auto'] and refill and 0 < refill - now <= STAY_WINDOW:
                     return  # live account refills within 15 min: do not close ChatGPT / Codex for that
                 candidates = self.with_pick('codex', codex_order(rows, active, now, self.config['remaining_below'])) \
@@ -2328,11 +2338,11 @@ class Service:
         return min(due) if due else (None, None)
 
     def codex_refill_in(self, now, settle=10):
-        """Seconds until just after the live Codex account's 5 h window resets, while threads wait for quota."""
+        """Seconds until just after the live Codex account can work again (codex_refill), while threads wait for quota."""
         if not (self.codex_waiting and self.codex_state['waitcontinue']):
             return None
         row = self.codex_state['profiles'].get(self.codex_state['active']) or {}
-        reset = reset_epoch((row.get('5h') or {}).get('reset_at'))
+        reset = codex_refill(row)
         if not reset or not codex_exhausted(row) or reset + settle <= now:
             return None  # past it already: the normal poll keeps looking
         return reset + settle - now

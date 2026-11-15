@@ -18,8 +18,12 @@ class Session:
     def __init__(self, pid, link, connected=True):
         self.pid, self.link, self.connected = pid, link, connected
         self.menu, self.selected, self.history, self.n, self.buffer, self.title = False, 2, [], 0, '', None
+        self.notice = False  # Claude Code's "We recommend compacting earlier" dialog over the input box
 
     def screen(self):
+        if self.notice:
+            return (' We recommend compacting earlier\n   ❯ Autocompact at ‹ 400k › tokens\n     Keep auto (1m tokens)\n'
+                    '   ↑/↓ choose · ←/→ change size · enter confirm · esc not now')
         if not self.menu:
             return PROMPT
         rows = ['Disconnect this session', 'Show QR code', 'Continue']
@@ -37,6 +41,11 @@ class Session:
             self.connected, self.link, self.title = True, f'new-{self.pid}-{self.n}', title or None
 
     def key(self, key):
+        if self.notice:
+            self.notice = key != 'esc'
+            if self.notice:
+                self.buffer = ''  # the dialog takes the keys
+            return
         if not self.menu and key == 'enter' and self.buffer:  # tmux: typed text runs on Enter
             text, self.buffer = self.buffer, ''
             return self.type(text)
@@ -334,6 +343,15 @@ class RelinkerTests(unittest.TestCase):
         self.io.lines = {10: [(5, NOTICE), (9, '<local-command-stdout>Remote Control disconnected.</local-command-stdout>')]}
         self.run_it()
         self.assertNotIn('Clawbook', [n for n, _, _ in self.reports])
+
+    def test_claude_codes_suggestion_dialog_is_put_away_first(self):
+        # "We recommend compacting earlier ... esc not now" kept a session's link from coming back
+        for pid in (10, 20):
+            self.io.sessions[pid].notice = True
+        self.run_it()
+        self.assertEqual(sorted(self.reports), [('Clawbook', 'new-10-1', None), ('Control room', 'new-20-1', None)])
+        for pid in (10, 20):
+            self.assertEqual((self.io.sessions[pid].notice, self.io.sessions[pid].history), (False, []))
 
     def test_a_draft_is_never_sent_along_with_remote_control(self):
         self.io.sessions[20].screen = lambda: PROMPT.replace('❯', '❯ 幫我寫條訊息畀 Control-room')

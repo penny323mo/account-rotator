@@ -259,6 +259,14 @@ class InterruptedThreadTests(unittest.TestCase):
         self.thread('child', [self.ev('task_started')], parent='open')
         self.assertEqual(self.io.interrupted_threads(), [])
 
+    def test_turn_aborted_on_the_usage_limit_is_captured(self):
+        # 2026-11-15 20:54: Codex ended the turn as turn_aborted with the week at 100 %; it was never continued
+        limits = lambda used: {'type': 'event_msg', 'payload': {'type': 'token_count', 'rate_limits': {
+            'primary': {'used_percent': 45.0}, 'secondary': {'used_percent': used}, 'rate_limit_reached_type': None}}}
+        self.thread('limited', [self.ctx, self.ev('task_started'), limits(100.0), self.ev('turn_aborted')])
+        self.thread('stopped', [self.ctx, self.ev('task_started'), limits(60.0), self.ev('turn_aborted')])
+        self.assertEqual([t['thread'] for t in self.io.interrupted_threads()], ['limited'])
+
     def test_long_lived_thread_in_an_old_day_folder_is_captured(self):
         # A ChatGPT-app thread started weeks ago still appends to its first day's rollout file.
         self.thread('longlived', [self.ctx, self.ev('task_started')])
