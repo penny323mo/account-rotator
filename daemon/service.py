@@ -782,6 +782,16 @@ class Service:
                     error = str(e) if isinstance(e, QuotaError) else 'QUOTA_INTERNAL_ERROR'
                     with self.lock:
                         row = copy.deepcopy(self.rows.get(label, {'label': label, 'groups': []}))
+                    row.pop('verify_url', None)
+                    if not row.get('email') and hasattr(self.profiles, 'display_email'):
+                        try:  # after a restart a failing account still shows who it is
+                            email = self.profiles.display_email(label)
+                            if isinstance(email, str):
+                                row['email'] = email
+                        except Exception:
+                            pass
+                    if getattr(e, 'url', None):
+                        row['verify_url'] = e.url  # the page offers it: only Penny can verify the account
                     age = time.time() - (timestamp(row.get('updated_at')) or 0)
                     if (row.get('status') == 'OK' and transient(error)
                             and age <= max(120, self.config['poll_seconds'] * 2)):

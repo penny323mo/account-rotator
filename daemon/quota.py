@@ -181,12 +181,31 @@ def request(url, data, access=None):
                 raise QuotaError('INVALID_RESPONSE')
             return result
     except urllib.error.HTTPError as e:
+        url = None if form or e.code != 403 else verify_url(e)
+        if url:  # Google wants the account verified in a browser first (GEMINI_F, 2026-11-16 20:00 on)
+            error = QuotaError('VERIFY_REQUIRED')
+            error.url = url
+            raise error from None
         # Do not include the request, headers, response body, or exception text.
         raise QuotaError(('TOKEN_' if form else 'QUOTA_') + f'HTTP_{e.code}') from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise QuotaError('NETWORK_UNAVAILABLE') from None
     except (ValueError, UnicodeError):
         raise QuotaError('INVALID_RESPONSE') from None
+
+
+def verify_url(error):
+    """The accounts.google.com link of a 403 VALIDATION_REQUIRED ("Verify your account to continue."), else None."""
+    try:
+        details = json.loads(error.read(64 * 1024)).get('error', {}).get('details') or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    for d in details:
+        if isinstance(d, dict) and d.get('reason') == 'VALIDATION_REQUIRED':
+            url = (d.get('metadata') or {}).get('validation_url')
+            if isinstance(url, str) and url.startswith('https://accounts.google.com/'):
+                return url
+    return None
 
 
 def normalize(data):
