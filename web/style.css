@@ -364,3 +364,8 @@ header{align-items:center}.remote-dialog{width:min(420px,calc(100% - 24px));max-
 /* Phone upright, iPad sideways, any screen: the Codex / Claude cards share the height with the toggles and the progress
    list; they keep their natural height (email, bars and reset times stay visible) and the panel scrolls when they do not all fit. */
 #codexAccounts,#claudeAccounts,#codexAccounts.dense,#claudeAccounts.dense,#codexPanel.many #codexAccounts,#claudePanel.many #claudeAccounts{flex:none!important;grid-template-rows:none!important;grid-auto-rows:auto!important}#codexAccounts .card,#claudeAccounts .card,#codexAccounts .card.active,#claudeAccounts .card.active{min-height:auto!important}#codexPanel,#claudePanel{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+
+/* Any screen (iPhone Duo outer / inner, folded or open, upright or sideways): the one-screen home splits the height
+   between the account cards only while each still fits its content; when it does not, the cards keep their height
+   and the page scrolls instead of squashing them. */
+body:not(.settings-open) #homePanel,#accounts{min-height:auto}#accounts{grid-template-rows:repeat(var(--rows,3),minmax(min-content,1fr))}body:not(.settings-open) main{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
