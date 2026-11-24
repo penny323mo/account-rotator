@@ -378,7 +378,8 @@ class WaitForQuotaTests(AutoContinueTests.__base__):
         self.s.refresh_codex()
         self.codex.continue_thread.assert_called_once_with(T1, 'gpt-6-astra')
 
-    def test_manual_switch_hands_the_waiting_threads_over(self):
+    def test_manual_switch_onto_an_account_with_quota_continues_the_waiting_threads(self):
+        # 2026-11-24 Penny: what waits for quota goes on once a switch by hand put an account with quota live
         self.s.refresh_codex()
         self.assertEqual([w['thread'] for w in self.s.codex_waiting], [T1])
         self.rows['CODEX_B'] = codex_row(five=60, weekly=40)
@@ -386,9 +387,8 @@ class WaitForQuotaTests(AutoContinueTests.__base__):
         self.rows['CODEX_A'], self.rows['CODEX_B'] = codex_row(five=0), codex_row(five=60, weekly=40, active=True)
         self.s.last_codex_switch = 0
         self.s.refresh_codex()
-        self.codex.continue_thread.assert_not_called()
-        self.assertEqual(self.s.codex_waiting, [])
-        self.assertIn('codex_waiting_cleared', [e['kind'] for e in self.s.events])
+        self.codex.continue_thread.assert_called_once_with(T1, 'gpt-6-astra')
+        self.assertNotIn('codex_waiting_cleared', [e['kind'] for e in self.s.events])
 
     def test_waiting_list_survives_a_restart(self):
         self.s.refresh_codex()

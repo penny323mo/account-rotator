@@ -484,10 +484,32 @@ class ClaudeAutoContinueTests(ClaudeServiceTests.__base__):
         self.wait_idle()
         self.s.relinker.resume.assert_called_once_with(self.record)
 
-    def test_manual_switch_never_continues_automatically(self):
-        # a switch by hand does nothing automatic; the ▶ button is there for that
+    def test_manual_switch_while_waiting_for_quota_continues_on_the_new_account(self):
+        # 2026-11-24 Penny: 24/7_V2 stopped on CLAUDE_B and the rotator waited; her switch to CLAUDE_A dropped that
+        # wait and she typed Resume by hand. A switch onto an account with quota now ends the wait at once.
         self.quota(0, 70)
         self.s.refresh_claude(0)
+        self.assertTrue(self.s.claude_waiting)
+        self.claude.use.return_value = {'selected': 'CLAUDE_B', 'previous': 'CLAUDE_A'}
+        self.s.call('claude.use', {'label': 'CLAUDE_B'})
+        for _ in range(200):
+            if not self.s.claude_relinking:
+                break
+            time.sleep(0.01)
+        self.claude.quota.return_value = {'profiles': {'CLAUDE_A': claude_row(0, 2 * H),
+                                                       'CLAUDE_B': claude_row(70, 3 * H, active=True)}, 'active': 'CLAUDE_B'}
+        self.s.refresh_claude(0, force=True)
+        self.wait_idle()
+        self.s.relinker.resume.assert_called_once_with(self.record)
+        self.assertNotIn('claude_waiting_cleared', self.kinds())
+
+    def test_manual_switch_never_continues_what_nothing_waited_for(self):
+        # 2026-10-12 Penny: a switch by hand does nothing automatic; the ▶ button is there for that
+        stopped, self.stopped = self.stopped, {}
+        self.quota(0, 70)
+        self.s.refresh_claude(0)                # nothing stopped yet: the rotator waits for nothing
+        self.stopped = stopped                  # the session stops, the switch comes before the rotator noticed
+        self.assertFalse(self.s.claude_waiting)
         self.claude.use.return_value = {'selected': 'CLAUDE_B', 'previous': 'CLAUDE_A'}
         self.s.call('claude.use', {'label': 'CLAUDE_B'})
         for _ in range(200):

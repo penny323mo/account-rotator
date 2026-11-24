@@ -1077,7 +1077,12 @@ class Service:
                 for name, r in self.claude_state['profiles'].items():
                     r['active'] = name == result['selected']
                 self.event('claude_switched', selected=result['selected'], source=source)
-            if source == 'manual':
+            with self.lock:
+                waiting = self.claude_waiting
+            if source == 'manual' and not waiting:
+                # a switch by hand leaves what stopped to the user - unless the rotator was already waiting for quota to
+                # continue it: switching onto an account with quota then lets that wait end at once (2026-11-24 Penny:
+                # 24/7_V2 stopped on CLAUDE_B 07:46, waited, the switch to CLAUDE_A 07:49 dropped it and she typed Resume)
                 self.claude_hand_over()
             if result.get('activation') != 'UNCHANGED':  # 重設 onto the live account: links are still right
                 with self.lock:
@@ -2264,10 +2269,7 @@ class Service:
                 for name, r in self.codex_state['profiles'].items():
                     r['active'] = name == result['selected']
                 self.event('codex_switched', selected=result['selected'], source=source)
-                if source == 'manual' and self.codex_waiting:  # the user took over: nothing automatic follows
-                    self.event('codex_waiting_cleared', count=len(self.codex_waiting))
-                    self.codex_waiting = []
-                    self.save_waiting()
+                # threads waiting for quota stay waiting: on an account with quota they go on (as for Claude, 2026-11-24)
             return result
         except QuotaError as e:
             with self.lock:
