@@ -82,6 +82,9 @@ class FakeIO:
     def alive(self, pid):
         return pid in self.meta
 
+    def in_pane(self, pane, pid):
+        return self.panes.get(pane) == pid
+
     def tmux(self, pane, *keys, literal=False):
         s = self.sessions[self.panes[pane]]
         for k in keys:
@@ -268,6 +271,16 @@ class RelinkerTests(unittest.TestCase):
         del self.io.meta[20]['tmux']
         self.run_it()
         self.assertIn(('Control room', None, 'NO_TERMINAL'), self.reports)
+
+    def test_session_recorded_with_another_sessions_pane_is_not_typed_into(self):
+        # a terminal started from inside tmux passes TMUX on: this session runs elsewhere but names Clawbook's pane
+        self.io.sessions[40] = Session(40, 'old-40')
+        self.io.meta[40] = {'name': 'Elsewhere', 'cwd': '/w/e', 'tmux': 'claude:@0.%0'}
+        self.io.status[40] = 'idle'
+        self.r.run(lambda rec, link, err: self.reports.append((rec['name'], link, err)))
+        self.assertIn(('Elsewhere', None, 'NO_TERMINAL'), self.reports)
+        self.assertIn(('Clawbook', 'new-10-1', None), self.reports)
+        self.assertEqual(self.io.sessions[10].title, 'Clawbook')
 
     def test_sessions_noted_before_the_switch_are_the_ones_handled(self):
         before = {20: dict(self.io.records()[1])}

@@ -96,6 +96,22 @@ class SystemIO:
             return
         subprocess.run([TMUX, 'send-keys', '-t', pane] + list(keys), capture_output=True, timeout=10, check=True)
 
+    def in_pane(self, pane, pid):
+        """The process runs inside that tmux pane (its shell is one of the process's ancestors)."""
+        shell = subprocess.run([TMUX, 'display-message', '-p', '-t', pane, '#{pane_pid}'], capture_output=True,
+                               text=True, timeout=10).stdout.strip()
+        if not shell.isdigit():
+            return False
+        seen = set()
+        while pid and pid > 1 and pid not in seen:
+            if pid == int(shell):
+                return True
+            seen.add(pid)
+            out = subprocess.run(['ps', '-o', 'ppid=', '-p', str(pid)], capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+            pid = int(out) if out.isdigit() else 0
+        return False
+
     def screen(self, pane):
         """The tmux pane's screen as text."""
         return subprocess.run([TMUX, 'capture-pane', '-p', '-t', pane], capture_output=True, text=True,
@@ -312,10 +328,16 @@ class Relinker:
         return bool(EMPTY_PROMPT.search('\n'.join(screen.rstrip().splitlines()[-14:])))
 
     def terminal(self, record):
-        """The session's tmux pane, or None outside tmux."""
-        if record.get('tmux'):
-            return record['tmux'].split(':', 1)[-1].split('.', 1)[-1]  # 'claude:@0.%0' -> '%0'
-        return None
+        """The session's tmux pane, or None outside tmux. A terminal started from inside tmux passes TMUX on, so a
+        session in another app can be recorded with a pane that holds a different session: it counts only when the
+        process really runs there (2026-11-25 a session's /remote-control was typed into another session's pane)."""
+        if not record.get('tmux'):
+            return None
+        pane = record['tmux'].split(':', 1)[-1].split('.', 1)[-1]  # 'claude:@0.%0' -> '%0'
+        try:
+            return pane if self.io.in_pane(pane, record.get('pid')) else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
 
     def send(self, where, key=None, text=None):
         if text:
