@@ -581,10 +581,38 @@ def resume_command(plan, thread_id, prompt):
             cmd += [flag, plan[key]]
     if plan.get("effort"):
         cmd += ["-c", f'model_reasoning_effort="{plan["effort"]}"']
+    # Its "Update available" screen would take the prompt, as the trust question did (ensure_trusted)
+    cmd += ["-c", "check_for_update_on_startup=false"]
     for root in plan.get("roots") or []:
         if root != plan.get("cwd"):
             cmd += ["--add-dir", root]
     return cmd + [prompt]
+
+
+def ensure_trusted(cwd, home=None):
+    """Codex CLI 0.167 asks "Trust this folder?" in a project not yet trusted; the resumed CLI waited there and the
+    prompt (and two typed after it) never reached the thread (2026-11-26 01:14, a project the app had worked in for
+    days). Neither -c projects.<dir>.trust_level nor the bypass flags skip it, so the folder is trusted in config.toml
+    as answering "Trust and continue" does: a thread resumed there already runs with its own permissions.
+    Returns True when it was added."""
+    path = Path(home or live_home()) / "config.toml"
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        text = ""
+    key = cwd.replace("\\", "\\\\").replace('"', '\\"')
+    if re.search(r'^\[projects\."' + re.escape(key) + r'"\]\s*$', text, re.M):
+        return False
+    block = ("" if not text or text.endswith("\n") else "\n") + f'\n[projects."{key}"]\ntrust_level = "trusted"\n'
+    fd, temp = tempfile.mkstemp(dir=str(path.parent), prefix=".config.toml.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text + block)
+    try:
+        os.chmod(temp, path.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(temp, path)
+    return True
 
 
 TMUX_COMMAND_MAX = 8000  # bytes; tmux refuses a command over ~16 KB ("command too long", tmux 3.6a)
@@ -683,6 +711,7 @@ def _continue(a, state):
         sys.exit("ERROR: this thread's last turn is still running; wait for it or interrupt it first")
     if not plan["cwd"] or not os.path.isdir(plan["cwd"]):
         sys.exit(f"ERROR: project directory {plan['cwd']} not found")
+    res["trusted_now"] = ensure_trusted(plan["cwd"])
     window = f"codex-{a.thread[-6:]}"
     exists = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True).returncode == 0
     line, prompt_file = tmux_shell(cmd)
