@@ -21,6 +21,7 @@ import gemini_app
 from enroll import AccountAdder
 import re
 from quota import Profiles, QuotaClient, QuotaError, stamp, timestamp
+import agy_model
 
 DEFAULTS = {'enabled': False, 'poll_seconds': 60, 'time_enabled': False,
             'hourly_minutes': [15], 'usage_enabled': True, 'remaining_below': 5,
@@ -288,6 +289,7 @@ class Service:
         self.client = client or QuotaClient(self.profiles)
         self.broker = broker or Broker(self.root, self.profiles)
         self.broker.on_park = self.agy_closed
+        self.broker.fit_model = self.fit_agy_model
         self.own_agy_until = 0.0  # end of the rotator's own last agy run (warm-up / switch probe)
         self.busy = busy or (lambda: working(ignore_until=self.own_agy_until))
         self.codex = codex or CodexAccounts()
@@ -1830,6 +1832,18 @@ class Service:
                 self.event('agy_closed', project=project, command=command)
                 if self.config['notify']:
                     self.notifier(f"轉帳號時關咗 {project} 嘅 agy，用呢句接返個對話：{command}")
+
+    def fit_agy_model(self):
+        """agy's model on one the live account offers (agy_model): not every account has every Gemini model, and agy
+        refuses a model the account does not have."""
+        with self.lock:
+            live = self.profiles.active()
+            row = self.rows.get(live) or {}
+            models = [m for g in row.get('groups') or [] for m in g.get('models') or []]
+        changed = agy_model.fit(models, str(self.root / 'agy_model.json'))
+        if changed:
+            with self.lock:
+                self.event('agy_model_changed', selected=changed[1], previous=changed[0])
 
     def own_agy(self, fn, *args, **kwargs):
         """Run a broker call that runs agy itself; its conversation writes must not read as the user's work."""

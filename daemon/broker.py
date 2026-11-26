@@ -162,6 +162,7 @@ class Broker:
         self.parker = parker or Parker()
         self.blockers = []  # [{cwd, reason}] of the agy sessions that refused the last switch
         self.on_park = None  # Service: callback([(item, error)]) after paused agy sessions were resumed
+        self.fit_model = None  # Service: callback() after a switch: agy's model, before anything starts again
 
     def warm(self, label):
         """One tiny agy prompt as an idle account (helper restores the live account afterwards)."""
@@ -252,6 +253,11 @@ class Broker:
             return self._switch_locked(label, previous, close_all, force)
         finally:
             lock.release()
+            if self.fit_model:
+                try:
+                    self.fit_model()  # before anything starts on the new account
+                except Exception:
+                    pass
             if parked and self.on_park:  # switched or not: say how to resume each closed session
                 self.on_park(self.parker.commands(parked))
 

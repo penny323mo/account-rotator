@@ -140,6 +140,12 @@ class BrokerParkTests(unittest.TestCase):
         self.assertEqual(self.io.log, [('terminate', 101), ('helper', False)])  # agy gone before the account changes
         self.assertEqual([i['command'] for i in self.results], [f'agy --dangerously-skip-permissions --conversation={CONV}'])
 
+    def test_agy_model_is_fitted_to_the_new_account_after_the_switch(self):
+        self.b.fit_model = lambda: self.io.log.append(('fit', self.active[0]))
+        with self.helper():
+            self.b.switch('B', close_all=True)
+        self.assertEqual(self.io.log, [('terminate', 101), ('helper', False), ('fit', 'B')])
+
     def test_closed_session_is_reported_even_when_the_switch_fails(self):
         with self.helper(ok=False), self.assertRaises(QuotaError):
             self.b.switch('B', close_all=True)

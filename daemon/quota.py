@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from agy_model import listed_models
 
 CLIENT_ID_HASH = 'bf00c418024ba6bf606ccdc37120976e41bc429dd1d46ecf16a729aa532626ea'
 CLIENT_SECRET_HASH = '1d2f041093fd95aa8995a038c711d50a7960da09a505381c09a745d6ad0ecc60'  # gitleaks:allow (a SHA-256 used to recognise the secret, not the secret)
@@ -245,7 +246,7 @@ def normalize(data):
             }
         if any(g['family'] == family for g in result):
             raise QuotaError('AMBIGUOUS_QUOTA_SCHEMA')
-        result.append({'family': family, 'windows': windows})
+        result.append({'family': family, 'windows': windows, 'models': listed_models(group.get('description'))})
     if not result or not any(b['remaining_percent'] is not None
                              for g in result for b in g['windows'].values()):
         raise QuotaError('QUOTA_UNAVAILABLE')
