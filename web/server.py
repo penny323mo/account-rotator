@@ -461,7 +461,8 @@ class Handler(BaseHTTPRequestHandler):
                   '/agy/icon.svg': ('icon.svg', 'image/svg+xml'), '/agy/style.css': ('style.css', 'text/css'),
                   '/agy/backdrop.svg': ('backdrop.svg', 'image/svg+xml'),
                   '/agy/manifest.webmanifest': ('manifest.webmanifest', 'application/manifest+json'),
-                  '/agy/apple-touch-icon.png': ('apple-touch-icon.png', 'image/png')}
+                  '/agy/apple-touch-icon.png': ('apple-touch-icon.png', 'image/png'),
+                  '/agy/icon-512.png': ('icon-512.png', 'image/png')}
         if path not in public and not self.gate(api=path != '/agy/'):
             return
         if path == '/agy/api/status':
