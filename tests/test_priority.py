@@ -5,7 +5,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'daemon'))
 import isolation  # noqa: F401  (no real Codex/agy helpers in tests)
 from service import Service
@@ -246,7 +246,8 @@ class CodexPriorityTests(unittest.TestCase):
                                                 'active': next(k for k, r in self.rows.items() if r['active'])}
         self.codex.use.side_effect = lambda label: {'selected': label, 'previous': None, 'codex_running': [], 'app_reopened': True}
         self.s = Service(self.temp.name, Mock(list=Mock(return_value={'A': {}}), active=Mock(return_value='A')), Mock(), Mock(),
-                         Mock(return_value=[]), codex=self.codex, watch_io=Mock(codex_working=Mock(return_value=[])))
+                         Mock(return_value=[]), codex=self.codex,
+                         watch_io=Mock(codex_working=Mock(return_value=[]), interrupted_threads=Mock(return_value=[])))
         self.s.call('codex.auto.set', {'enabled': True})
 
     def crow(self, five, weekly, active=False, five_reset=4 * H, weekly_reset=100 * H):
@@ -318,6 +319,27 @@ class CodexPriorityTests(unittest.TestCase):
         self.rows = {'CODEX_A': self.crow(0, 50, active=True, five_reset=5 * 60), 'CODEX_B': self.crow(90, 90)}
         self.s.refresh_codex()
         self.codex.use.assert_not_called()
+
+
+    def test_what_stops_while_staying_for_a_refill_is_noted_and_goes_on_at_the_refill(self):
+        # used up with the weekly refill in 10 min: it stayed, but nothing was noted to continue
+        self.s.call('codex.waitcontinue.set', {'enabled': True})
+        stopped = {'thread': 'T1', 'cwd': '/w/onlyjump', 'model': 'gpt-6-astra'}
+        self.s.watch_io.interrupted_threads.return_value = [stopped]
+        self.s.watch_io.rollout.return_value = None
+        self.rows = {'CODEX_A': self.crow(50, 0, active=True, weekly_reset=10 * 60), 'CODEX_B': self.crow(90, 90)}
+        self.s.refresh_codex()
+        self.codex.use.assert_not_called()
+        self.assertEqual([w['thread'] for w in self.s.codex_waiting], ['T1'])
+        self.assertEqual([e['kind'] for e in self.s.events].count('codex_waiting_quota'), 1)
+        self.s.refresh_codex()  # staying on: noted once, reported once
+        self.assertEqual([w['thread'] for w in self.s.codex_waiting], ['T1'])
+        self.assertEqual([e['kind'] for e in self.s.events].count('codex_waiting_quota'), 1)
+        with patch.object(self.s, 'codex_continue') as go:
+            self.rows['CODEX_A'] = self.crow(50, 100, active=True)
+            self.s.refresh_codex()
+        go.assert_called_once()
+        self.assertEqual([w['thread'] for w in go.call_args.args[0]], ['T1'])
 
 
 if __name__ == '__main__':

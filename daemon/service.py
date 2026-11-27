@@ -338,6 +338,7 @@ class Service:
             self.codex_watches = []
         self.last_codex_switch = 0
         self.codex_all_exhausted = False
+        self.codex_staying = False  # the live Codex account refills within STAY_WINDOW: staying, noting what stopped
         try:  # threads stopped while every Codex account was used up; continued once quota returns
             self.codex_waiting = json.loads((self.root / 'codex_waiting.json').read_text())
             if not isinstance(self.codex_waiting, list):
@@ -1503,16 +1504,29 @@ class Service:
             refilled, waiting, candidates, capture = not active or not codex_exhausted(rows.get(active, {})), [], [], False
             if refilled:
                 self.codex_all_exhausted = False
+                self.codex_staying = False
                 if state['waitcontinue'] and active and rows.get(active, {}).get('status') == 'OK' and self.codex_waiting:
                     waiting, self.codex_waiting = self.codex_waiting, []
                     self.save_waiting()
             else:
                 refill = codex_refill(rows[active])
                 if state['auto'] and refill and 0 < refill - now <= STAY_WINDOW:
-                    return  # live account refills within 15 min: do not close ChatGPT / Codex for that
-                candidates = self.with_pick('codex', codex_order(rows, active, now, self.config['remaining_below'])) \
-                    if state['auto'] else []
-                if not candidates and not self.codex_all_exhausted:
+                    # Live account refills within 15 min: do not close ChatGPT / Codex for that. What stopped is
+                    # still noted, so it goes on at the refill (2026-11-27: nothing had been noted and nothing would
+                    # have continued).
+                    if not state['waitcontinue']:
+                        return
+                    capture = True
+                    if not self.codex_staying:
+                        self.codex_staying = True
+                        self.event('codex_waiting_quota', selected=active, stay=True)
+                    candidates = []
+                else:
+                    candidates = self.with_pick('codex', codex_order(rows, active, now, self.config['remaining_below'])) \
+                        if state['auto'] else []
+                if capture:
+                    pass
+                elif not candidates and not self.codex_all_exhausted:
                     self.codex_all_exhausted = True
                     self.event('codex_all_exhausted' if state['auto'] else 'codex_waiting_quota')
                     capture = state['waitcontinue']
