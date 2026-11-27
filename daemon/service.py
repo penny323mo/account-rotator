@@ -319,6 +319,16 @@ class Service:
             self.claude_state['waitcontinue'] = json.loads((self.root / 'claude.json').read_text()).get('waitcontinue') is not False
         except (OSError, ValueError, AttributeError):
             pass
+        try:
+            # The last good numbers, so a rate-limited first poll after a restart shows them (marked stale) instead of
+            # nothing (a card stayed blank for 45 minutes after a restart)
+            saved = json.loads((self.root / 'claude_rows.json').read_text())
+            self.claude_state.update(
+                profiles={k: {**r, 'stale': 'SAVED'} for k, r in saved['profiles'].items()
+                          if isinstance(r, dict) and r.get('status') == 'OK'},
+                active=saved.get('active'), updated_at=saved.get('updated_at'))
+        except (OSError, ValueError, AttributeError, KeyError, TypeError):
+            pass
         self.claude_waiting = False
         self.claude_relinking = False
         self.claude_relink_gen = 0  # a newer switch's relink supersedes the one still running
@@ -1047,6 +1057,14 @@ class Service:
                 if self.claude_good >= 10 and interval > base:
                     self.claude_interval, self.claude_good = max(base, interval // 2), 0
             self.claude_next_poll = now + max(self.claude_interval, base)
+            good = {k: {x: v for x, v in r.items() if x != 'stale'} for k, r in profiles.items()
+                    if r.get('status') == 'OK'}  # a stale row still holds its last good numbers
+            saved = {'profiles': good, 'active': data['active'], 'updated_at': self.claude_state['updated_at']}
+        if good:
+            try:
+                atomic_json(self.root / 'claude_rows.json', saved)
+            except OSError:
+                pass
         try:
             stopped = self.claude_latest_first(self.relinker.stopped_sessions())
             target = self.claude_current_target()

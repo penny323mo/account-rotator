@@ -270,6 +270,22 @@ class ClaudeServiceTests(unittest.TestCase):
         self.s.refresh_claude(1000)
         self.assertEqual(self.s.status()['claude']['profiles']['CLAUDE_A']['status'], 'HTTP_429')
 
+    def test_a_rate_limited_first_poll_after_a_restart_shows_the_saved_numbers_as_stale(self):
+        self.s.refresh_claude(1000)
+        again = Service(self.temp.name, Mock(list=Mock(return_value={}), active=Mock(return_value=None)), Mock(), Mock(),
+                        Mock(return_value=[]), claude=self.claude, codex=self.codex, adder=self.adder,
+                        watch_io=Mock(codex_working=Mock(return_value=[])))
+        a = again.status()['claude']['profiles']['CLAUDE_A']
+        self.assertEqual((a['5h']['remaining_percent'], a['stale']), (33, 'SAVED'))
+        self.claude.quota.return_value = self.limited()
+        again.refresh_claude(1060)
+        a = again.status()['claude']['profiles']['CLAUDE_A']
+        self.assertEqual((a['status'], a['5h']['remaining_percent'], a['stale']), ('OK', 33, 'HTTP_429'))
+        now = time.time()
+        again.warm_idle(now)
+        again.warm_idle(now + WARM_DELAY + 1)
+        self.claude.warm.assert_not_called()  # saved numbers decide nothing
+
     def test_refresh_is_scoped_to_the_tab_that_asked(self):
         for provider in ('claude', 'codex'):
             self.claude.quota.reset_mock(); self.codex.quota.reset_mock(); self.s.client.fetch.reset_mock()
