@@ -43,6 +43,7 @@ URGENT_RESET = 6 * 3600  # weekly quota resetting within 6 h is used first, even
 URGENT_FLOOR = 1  # % weekly: below this there is nothing left to burn
 RESET_BUCKET = 6 * 3600
 STAY_WINDOW = 15 * 60
+RESET_GRACE = 3 * 60  # seconds after a refill time before still-used-up numbers count as real
 
 
 # Warm-up: a 5 h window only starts counting at first use, so an idle account that refilled to 100 % gets one
@@ -337,6 +338,7 @@ class Service:
         except (OSError, ValueError):
             self.codex_watches = []
         self.last_codex_switch = 0
+        self.codex_limit_hit = 0  # when a continue last ended on the usage limit: the live account is really used up
         self.codex_all_exhausted = False
         self.codex_staying = False  # the live Codex account refills within STAY_WINDOW: staying, noting what stopped
         try:  # threads stopped while every Codex account was used up; continued once quota returns
@@ -1497,10 +1499,13 @@ class Service:
         stopped once the live account has quota again (waitcontinue) - each setting works without the other."""
         with self.lock:
             state = self.codex_state
-            if (not (state['auto'] or state['waitcontinue']) or state['switching'] or self.codex_manual_continuing
-                    or now - self.last_codex_switch < CODEX_COOLDOWN):
-                return
             active, rows = state['active'], state['profiles']
+            # The cooldown keeps stale numbers from ping-ponging accounts; a continue that ended on the limit since
+            # the last switch is no stale number
+            hit = self.codex_limit_hit > self.last_codex_switch and codex_exhausted(rows.get(active, {}))
+            if (not (state['auto'] or state['waitcontinue']) or state['switching'] or self.codex_manual_continuing
+                    or (now - self.last_codex_switch < CODEX_COOLDOWN and not hit)):
+                return
             refilled, waiting, candidates, capture = not active or not codex_exhausted(rows.get(active, {})), [], [], False
             if refilled:
                 self.codex_all_exhausted = False
@@ -1510,7 +1515,9 @@ class Service:
                     self.save_waiting()
             else:
                 refill = codex_refill(rows[active])
-                if state['auto'] and refill and 0 < refill - now <= STAY_WINDOW:
+                # Also just after the refill time, until the numbers catch up (a refilled account still read as used up
+                # was left for one whose 5 h window resumed threads spent in a minute)
+                if state['auto'] and refill and -RESET_GRACE < refill - now <= STAY_WINDOW:
                     # Live account refills within 15 min: do not close ChatGPT / Codex for that. What stopped is
                     # still noted, so it goes on at the refill (2026-11-27: nothing had been noted and nothing would
                     # have continued).
@@ -1950,6 +1957,8 @@ class Service:
                          finished_at=stamp(), summary=summary[:160] if summary else None,
                          released=not io.cli_alive(w['thread']))
                 self.save_watches()
+                if limited:
+                    self.codex_limit_hit = time.time()
                 self.event('codex_continue_done' if done else 'codex_continue_error' if failed
                            else 'codex_continue_limited' if limited else 'codex_continue_interrupted',
                            project=w['project'], summary=w['summary'], **({'error': error} if failed else {}))

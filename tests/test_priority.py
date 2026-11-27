@@ -342,5 +342,23 @@ class CodexPriorityTests(unittest.TestCase):
         self.assertEqual([w['thread'] for w in go.call_args.args[0]], ['T1'])
 
 
+    def test_a_continue_that_ended_on_the_limit_switches_without_waiting_out_the_cooldown(self):
+        self.rows = {'CODEX_A': self.crow(0, 50, active=True), 'CODEX_C': self.crow(90, 90)}
+        self.s.last_codex_switch = time.time() - 120
+        self.s.refresh_codex()
+        self.codex.use.assert_not_called()  # numbers alone: the cooldown still holds
+        self.s.codex_limit_hit = time.time()
+        self.s.refresh_codex()
+        self.codex.use.assert_called_once_with('CODEX_C')
+
+    def test_just_after_the_refill_time_it_waits_for_fresh_numbers(self):
+        self.rows = {'CODEX_A': self.crow(50, 0, active=True, weekly_reset=-60), 'CODEX_B': self.crow(90, 90)}
+        self.s.refresh_codex()
+        self.codex.use.assert_not_called()
+        self.rows['CODEX_A'] = self.crow(50, 0, active=True, weekly_reset=-10 * 60)  # still used up long after
+        self.s.refresh_codex()
+        self.codex.use.assert_called_once_with('CODEX_B')
+
+
 if __name__ == '__main__':
     unittest.main()
