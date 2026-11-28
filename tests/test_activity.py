@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'daemon'))
@@ -190,19 +191,52 @@ class ClaudeWorkingTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.io = WatchIO(self.temp.name, claude_home=str(self.home / 'claude'))
 
-    def write(self, rel, age):
+    def write(self, rel, age, entries=None):
+        """A transcript whose last entry is `age` seconds old; by default a prompt still waiting for its answer."""
         f = self.home / 'claude' / 'projects' / rel
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text('{}\n')
-        t = time.time() - age
+        stamp = datetime.fromtimestamp(time.time() - age, timezone.utc).isoformat().replace('+00:00', 'Z')
+        entries = entries or [{'type': 'user', 'message': {'role': 'user', 'content': 'fix it'}}]
+        f.write_text(''.join(json.dumps({**e, 'timestamp': e.get('timestamp', stamp)}) + '\n' for e in entries))
+        t = time.time() - min(age, 5) if entries[-1].get('type') == 'system' else time.time() - age
         os.utime(f, (t, t))
+        return f
 
-    def test_a_session_that_wrote_in_the_last_two_minutes_is_working(self):
+    @staticmethod
+    def reply(stop, content=None):
+        return {'type': 'assistant', 'message': {'role': 'assistant', 'stop_reason': stop,
+                                                 'content': content or [{'type': 'text', 'text': 'done'}]}}
+
+    def test_a_prompt_waiting_for_its_answer_is_working(self):
         self.write('proj-a/2f6571ed-c4a2.jsonl', 30)
         self.assertEqual(self.io.claude_working(), ['transcript:2f6571ed'])
 
-    def test_quiet_sessions_are_idle(self):
-        self.write('proj-a/aaaaaaaa-1.jsonl', 600)
+    def test_a_running_tool_call_is_working_even_after_minutes_of_silence(self):
+        self.write('proj-a/2f6571ed-c4a2.jsonl', 600, [self.reply('tool_use', [{'type': 'tool_use', 'name': 'Bash'}])])
+        self.assertEqual(self.io.claude_working(), ['transcript:2f6571ed'])
+
+    def test_a_tool_result_waiting_for_the_model_is_working(self):
+        self.write('proj-a/2f6571ed-c4a2.jsonl', 20, [
+            self.reply('tool_use'), {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'tool_result'}]}}])
+        self.assertEqual(self.io.claude_working(), ['transcript:2f6571ed'])
+
+    def test_an_answered_session_is_idle_whatever_writes_its_transcript_later(self):
+        self.write('proj-a/aaaaaaaa-1.jsonl', 3 * 24 * 3600, [
+            {'type': 'user', 'message': {'role': 'user', 'content': 'fix it'}}, self.reply('end_turn'),
+            {'type': 'user', 'message': {'role': 'user', 'content': '<command-name>/remote-control</command-name>'}},
+            {'type': 'system', 'subtype': 'local_command', 'timestamp': datetime.now(timezone.utc).isoformat()},
+            {'type': 'bridge-session', 'bridgeSessionId': 'session_x'},
+            {'type': 'system', 'subtype': 'bridge_status', 'timestamp': datetime.now(timezone.utc).isoformat()}])
+        self.assertEqual(self.io.claude_working(), [])
+
+    def test_a_turn_ended_by_an_interruption_or_the_usage_limit_is_idle(self):
+        self.write('proj-a/aaaaaaaa-1.jsonl', 30, [
+            {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': '[Request interrupted by user]'}]}}])
+        self.write('proj-a/bbbbbbbb-2.jsonl', 30, [{**self.reply(None), 'isApiErrorMessage': True}])
+        self.assertEqual(self.io.claude_working(), [])
+
+    def test_an_open_turn_quiet_for_over_half_an_hour_is_idle(self):
+        self.write('proj-a/aaaaaaaa-1.jsonl', 2400)
         self.assertEqual(self.io.claude_working(), [])
 
     def test_subagent_transcripts_count_too(self):

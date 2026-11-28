@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 
@@ -20,6 +21,42 @@ def timestamp_of(value):
     from datetime import datetime
     return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
 
+
+
+def claude_last_turn_entry(path, tail):
+    """(epoch, entry) of the transcript's last prompt / reply / tool result, or None."""
+    with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - tail))
+        lines = f.read().splitlines()
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get('type') not in ('user', 'assistant') or d.get('isMeta'):
+            continue
+        content = (d.get('message') or {}).get('content')
+        if d['type'] == 'user' and isinstance(content, str) and content.lstrip().startswith(('<command-', '<local-command')):
+            continue  # a slash command such as /remote-control: no turn
+        try:
+            when = datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')).timestamp()
+        except (KeyError, ValueError, AttributeError):
+            continue
+        return when, d
+    return None
+
+
+def claude_turn_open(last):
+    _, d = last
+    message = d.get('message') or {}
+    content = message.get('content')
+    if d['type'] == 'assistant':
+        if d.get('isApiErrorMessage'):
+            return False  # the usage limit or another API error ended the turn
+        return message.get('stop_reason') == 'tool_use'  # a tool runs; end_turn / stop_sequence: answered
+    texts = [content] if isinstance(content, str) else [c.get('text', '') for c in content or [] if isinstance(c, dict)]
+    return not any('[Request interrupted by user' in t for t in texts)  # a prompt or tool result awaits the model
 
 class WatchIO:
     def __init__(self, codex_home=None, claude_home=None):
@@ -68,17 +105,24 @@ class WatchIO:
         self._turns[key] = (offset, last, message)
         return last, message
 
-    def claude_working(self, max_age=120):
-        """Claude Code sessions (any, they all share the live login) that wrote their transcript recently; the
-        rotator's own warm-ups use a throwaway config dir and never show up here. Reasons carry ids only."""
+    def claude_working(self, max_age=1800, tail=512 * 1024):
+        """Claude Code sessions (any, they all share the live login) in the middle of a turn; the rotator's own
+        warm-ups use a throwaway config dir and never show up here. Reasons carry ids only.
+        A transcript is written while nothing works, too: Remote Control's bridge-session / bridge_status lines and
+        the rotator's own /remote-control relinks. So the conversation itself decides: its last prompt, reply or tool call leaves the turn
+        open (a prompt or tool result waiting for the model, a tool call running) or finished (a final reply, an
+        interruption, an API error)."""
         now, found = time.time(), []
         for pattern in ('projects/*/*.jsonl', 'projects/*/*/subagents/*.jsonl'):
             for path in glob.glob(str(self.claude_home / pattern)):
                 try:
-                    if now - os.path.getmtime(path) <= max_age:
-                        found.append('transcript:' + os.path.basename(path)[:-len('.jsonl')][:8])
+                    if now - os.path.getmtime(path) > max_age:
+                        continue
+                    last = claude_last_turn_entry(path, tail)
                 except OSError:
                     continue
+                if last and claude_turn_open(last) and now - last[0] <= max_age:
+                    found.append('transcript:' + os.path.basename(path)[:-len('.jsonl')][:8])
         return sorted(found)
 
     def codex_working(self, max_age=1800):
